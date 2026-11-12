@@ -290,11 +290,11 @@ app.post('/signup', (req, res) => res.redirect('/login'));
 app.get('/login', (req, res) => {
   if (req.user) return res.redirect('/app');
   const notices = {
-    off: 'ระบบเข้าสู่ระบบด้วย Google ยังไม่เปิดใช้งาน กรุณาติดต่อฝ่ายบริการลูกค้า',
-    state: 'เซสชัน Google หมดอายุ กรุณาดำเนินการอีกครั้ง',
-    token: 'การเชื่อมต่อกับ Google ไม่สำเร็จ กรุณาดำเนินการอีกครั้ง',
-    profile: 'ไม่สามารถอ่านข้อมูลจาก Google ได้ กรุณาดำเนินการอีกครั้ง',
-    email: 'บัญชี Google นี้ไม่มีที่อยู่อีเมล',
+    off: 'การเข้าสู่ระบบด้วย Google ยังไม่เปิดใช้งาน กรุณาติดต่อฝ่ายบริการลูกค้า',
+    state: 'เซสชัน Google หมดอายุ (เปิดหน้านานหรือปิดคุกกี้ไว้) — กดปุ่มด้านล่างเพื่อเริ่มใหม่',
+    token: 'Google ไม่ได้ส่งข้อมูลกลับมา (อาจกดยกเลิกหรือการเชื่อมต่อหลุด) — กดปุ่มด้านล่างเพื่อลองอีกครั้ง',
+    profile: 'อ่านข้อมูลบัญชีจาก Google ไม่สำเร็จ — กดปุ่มด้านล่างเพื่อลองอีกครั้ง',
+    email: 'บัญชี Google นี้ไม่มีที่อยู่อีเมล — ใช้บัญชีอื่นหรือติดต่อฝ่ายบริการลูกค้า',
   };
   const notice = googleEnabled() ? (notices[String(req.query.google || '')] || '') : notices.off;
   res.type('html').send(V.authPage({ mode: 'login', google: googleEnabled(), notice }));
