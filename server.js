@@ -290,11 +290,11 @@ app.post('/signup', (req, res) => res.redirect('/login'));
 app.get('/login', (req, res) => {
   if (req.user) return res.redirect('/app');
   const notices = {
-    off: 'Google login ยังไม่เปิด — แจ้งแอดมิน',
-    state: 'เซสชัน Google หมดอายุ ลองอีกครั้ง',
-    token: 'เชื่อมต่อ Google ไม่สำเร็จ ลองอีกครั้ง',
-    profile: 'อ่านข้อมูลจาก Google ไม่ได้ ลองอีกครั้ง',
-    email: 'บัญชี Google นี้ไม่มีอีเมล',
+    off: 'ระบบเข้าสู่ระบบด้วย Google ยังไม่เปิดใช้งาน กรุณาติดต่อฝ่ายบริการลูกค้า',
+    state: 'เซสชัน Google หมดอายุ กรุณาดำเนินการอีกครั้ง',
+    token: 'การเชื่อมต่อกับ Google ไม่สำเร็จ กรุณาดำเนินการอีกครั้ง',
+    profile: 'ไม่สามารถอ่านข้อมูลจาก Google ได้ กรุณาดำเนินการอีกครั้ง',
+    email: 'บัญชี Google นี้ไม่มีที่อยู่อีเมล',
   };
   const notice = googleEnabled() ? (notices[String(req.query.google || '')] || '') : notices.off;
   res.type('html').send(V.authPage({ mode: 'login', google: googleEnabled(), notice }));
@@ -455,13 +455,13 @@ app.post('/app/keys', requireLogin, ah(async (req, res) => {
   const raw = 'JXK-' + randomToken(20);
   await q('INSERT INTO api_keys (user_id, name, prefix, key_hash) VALUES ($1,$2,$3,$4)', [req.user.id, 'key', raw.slice(0, 12), sha256Hex(raw)]);
   setCookie(res, 'jx_newkey', raw, 300);
-  setFlash(res, 'สร้างคีย์ใหม่แล้ว — คัดลอกเก็บไว้');
+  setFlash(res, 'สร้างคีย์เรียบร้อย กรุณาจัดเก็บคีย์อย่างปลอดภัย');
   res.redirect('/app');
 }));
 
 app.post('/app/keys/:id/revoke', requireLogin, ah(async (req, res) => {
   await q('UPDATE api_keys SET revoked = true WHERE id = $1 AND user_id = $2', [Number(req.params.id), req.user.id]);
-  setFlash(res, 'เพิกถอนคีย์แล้ว');
+  setFlash(res, 'ปิดใช้งานคีย์แล้ว');
   res.redirect('/app');
 }));
 
@@ -518,7 +518,7 @@ app.post('/order/:ref/notify', requireLogin, ah(async (req, res) => {
   if (!order) return res.status(404).type('html').send(V.errorPage({ title: 'ไม่พบออเดอร์', message: 'เลขออเดอร์ไม่ถูกต้อง', code: 404, user: req.user }));
   if (order.status === 'pending') {
     await q('UPDATE orders SET status = $1, payer_note = $2, updated_at = now() WHERE id = $3', ['review', String(req.body.note || '').slice(0, 200), order.id]);
-    setFlash(res, 'แจ้งโอนแล้ว — รอแอดมินตรวจสอบ');
+    setFlash(res, 'แจ้งการชำระเงินแล้ว อยู่ระหว่างตรวจสอบ');
   }
   res.redirect(`/order/${order.ref}`);
 }));
