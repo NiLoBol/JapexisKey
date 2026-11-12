@@ -463,7 +463,7 @@ app.get('/app', requireLogin, ah(async (req, res) => {
     orders,
     baseUrl: BASE_URL,
     model: modelId(),
-    credit: { estRequests, low },
+    credit: { estRequests, low, basis: estBasis },
     flash: takeFlash(req, res),
   }));
 }));
