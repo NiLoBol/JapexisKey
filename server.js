@@ -10,6 +10,9 @@ const BASE_URL = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).rep
 const UPSTREAM_BASE_URL = (process.env.UPSTREAM_BASE_URL || 'https://amr-link.open-design.ai/v1').replace(/\/+$/, '');
 const UPSTREAM_API_KEY = (process.env.UPSTREAM_API_KEY || '').trim();
 const COOKIE_SECURE = process.env.COOKIE_SECURE === '0' ? '' : '; Secure';
+const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID || '').trim();
+const GOOGLE_CLIENT_SECRET = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
+const GOOGLE_REDIRECT = (process.env.GOOGLE_REDIRECT_URI || `${BASE_URL}/auth/google/callback`).trim();
 
 const app = express();
 app.set('trust proxy', true);
@@ -67,11 +70,37 @@ function requireAdmin(req, res, next) {
 
 function priceTable() {
   return {
-    in: Number(settings.price_in_thb || 15),
-    out: Number(settings.price_out_thb || 60),
-    cacheRead: Number(settings.price_cache_read_thb || 0.5),
-    cacheWrite: Number(settings.price_cache_write_thb || 15),
+    in: Number(settings.price_in_thb || 1.5),
+    out: Number(settings.price_out_thb || 6),
+    cacheRead: Number(settings.price_cache_read_thb || 0.03),
   };
+}
+
+function googleEnabled() {
+  return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+}
+
+async function grantWelcome(client, userId) {
+  const amount = Number(settings.welcome_credit_thb || 0);
+  if (!(amount > 0)) return 0;
+  await client.query('UPDATE users SET balance_thb = balance_thb + $2::numeric WHERE id = $1', [userId, amount]);
+  await client.query('INSERT INTO ledger (user_id, delta_thb, reason) VALUES ($1,$2,$3)', [userId, amount, 'welcome']);
+  return amount;
+}
+
+const signupHits = new Map();
+function signupAllowed(ip) {
+  const now = Date.now();
+  let b = signupHits.get(ip);
+  if (!b || now - b.start > 3600000) {
+    b = { start: now, count: 0 };
+    signupHits.set(ip, b);
+  }
+  b.count += 1;
+  if (signupHits.size > 2000) {
+    for (const [k, v] of signupHits) if (now - v.start > 3600000) signupHits.delete(k);
+  }
+  return b.count <= 5;
 }
 
 function apiError(res, status, message, type = 'invalid_request_error', code = null) {
@@ -117,7 +146,7 @@ async function recordUsage(opts) {
   }
 
   const billableIn = Math.max(0, pt - cr - cw);
-  const cost = (billableIn * p.in + cr * p.cacheRead + cw * p.cacheWrite + ct * p.out) / 1000000;
+  const cost = (billableIn * p.in + cr * p.cacheRead + ct * p.out) / 1000000;
   const costRounded = Math.round(cost * 1000000) / 1000000;
 
   const client = await pool.connect();
@@ -183,7 +212,7 @@ app.use(ah(async (req, res, next) => {
 
 app.get('/', ah(async (req, res) => {
   const plans = await getPlans();
-  res.type('html').send(V.landing({ plans, prices: priceTable(), baseUrl: BASE_URL }));
+  res.type('html').send(V.landing({ plans, prices: priceTable(), baseUrl: BASE_URL, google: googleEnabled() }));
 }));
 
 app.get('/docs', ah(async (req, res) => {
@@ -215,35 +244,59 @@ app.get('/api/health', ah(async (req, res) => {
 /* ---------- auth pages ---------- */
 
 app.get('/signup', (req, res) => {
-  res.type('html').send(V.authPage({ mode: 'signup' }));
+  res.type('html').send(V.authPage({ mode: 'signup', google: googleEnabled() }));
 });
 
 app.post('/signup', ah(async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   const password = String(req.body.password || '');
+  if (!signupAllowed(clientIp(req))) {
+    return res.status(429).type('html').send(V.authPage({ mode: 'signup', google: googleEnabled(), error: 'สมัครบ่อยเกินไป — ลองใหม่ภายหลัง' }));
+  }
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
-    return res.status(400).type('html').send(V.authPage({ mode: 'signup', error: 'อีเมลไม่ถูกต้อง' }));
+    return res.status(400).type('html').send(V.authPage({ mode: 'signup', google: googleEnabled(), error: 'อีเมลไม่ถูกต้อง' }));
   }
   if (password.length < 8) {
-    return res.status(400).type('html').send(V.authPage({ mode: 'signup', error: 'รหัสผ่านอย่างน้อย 8 ตัวอักษร' }));
+    return res.status(400).type('html').send(V.authPage({ mode: 'signup', google: googleEnabled(), error: 'รหัสผ่านอย่างน้อย 8 ตัวอักษร' }));
   }
   const exists = await q('SELECT 1 FROM users WHERE email = $1', [email]);
   if (exists.rows.length) {
-    return res.status(409).type('html').send(V.authPage({ mode: 'signup', error: 'อีเมลนี้สมัครแล้ว — เข้าสู่ระบบได้เลย' }));
+    return res.status(409).type('html').send(V.authPage({ mode: 'signup', google: googleEnabled(), error: 'อีเมลนี้สมัครแล้ว — เข้าสู่ระบบได้เลย' }));
   }
-  const ins = await q('INSERT INTO users (email, pass_hash) VALUES ($1,$2) RETURNING id', [email, hashPassword(password)]);
-  const uid = ins.rows[0].id;
-
   const raw = 'JXK-' + randomToken(20);
-  await q('INSERT INTO api_keys (user_id, name, prefix, key_hash) VALUES ($1,$2,$3,$4)', [uid, 'default', raw.slice(0, 12), sha256Hex(raw)]);
+  const client = await pool.connect();
+  let uid = 0;
+  let welcome = 0;
+  try {
+    await client.query('BEGIN');
+    const ins = await client.query('INSERT INTO users (email, pass_hash) VALUES ($1,$2) RETURNING id', [email, hashPassword(password)]);
+    uid = ins.rows[0].id;
+    await client.query('INSERT INTO api_keys (user_id, name, prefix, key_hash) VALUES ($1,$2,$3,$4)', [uid, 'default', raw.slice(0, 12), sha256Hex(raw)]);
+    welcome = await grantWelcome(client, uid);
+    await client.query('COMMIT');
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    throw e;
+  } finally {
+    client.release();
+  }
 
   setCookie(res, 'jx_session', signSession(uid));
   setCookie(res, 'jx_newkey', raw, 300);
+  if (welcome > 0) setFlash(res, `ยินดีต้อนรับ — ได้เครดิตทดลอง ฿${welcome.toFixed(0)} ใช้ได้เลย`);
   res.redirect('/app');
 }));
 
 app.get('/login', (req, res) => {
-  res.type('html').send(V.authPage({ mode: 'login' }));
+  const notices = {
+    off: 'Google login ยังไม่เปิด — ใช้เมล/รหัสผ่านไปก่อน',
+    state: 'เซสชัน Google หมดอายุ ลองอีกครั้ง',
+    token: 'เชื่อมต่อ Google ไม่สำเร็จ ลองอีกครั้ง',
+    profile: 'อ่านข้อมูลจาก Google ไม่ได้ ลองอีกครั้ง',
+    email: 'บัญชี Google นี้ไม่มีอีเมล',
+  };
+  const notice = notices[String(req.query.google || '')] || '';
+  res.type('html').send(V.authPage({ mode: 'login', google: googleEnabled(), notice }));
 });
 
 app.post('/login', ah(async (req, res) => {
@@ -264,6 +317,111 @@ app.post('/logout', (req, res) => {
   clearCookie(res, 'jx_session');
   res.redirect('/');
 });
+
+/* ---------- google sign-in ---------- */
+
+app.get('/auth/google', (req, res) => {
+  if (!googleEnabled()) return res.redirect('/login?google=off');
+  const state = randomToken(12);
+  setCookie(res, 'jx_oauth_state', state, 600);
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: GOOGLE_REDIRECT,
+    response_type: 'code',
+    scope: 'openid email profile',
+    state,
+    prompt: 'select_account',
+  });
+  res.redirect('https://accounts.google.com/o/oauth2/v2/auth?' + params.toString());
+});
+
+app.get('/auth/google/callback', ah(async (req, res) => {
+  if (!googleEnabled()) return res.redirect('/login?google=off');
+  const cookies = parseCookies(req.headers.cookie);
+  const state = String(req.query.state || '');
+  if (!state || state !== cookies.jx_oauth_state) return res.redirect('/login?google=state');
+  clearCookie(res, 'jx_oauth_state');
+  if (!req.query.code) return res.redirect('/login?google=token');
+
+  let token;
+  try {
+    const tr = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code: String(req.query.code),
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: GOOGLE_REDIRECT,
+        grant_type: 'authorization_code',
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!tr.ok) return res.redirect('/login?google=token');
+    token = await tr.json();
+  } catch {
+    return res.redirect('/login?google=token');
+  }
+
+  let info;
+  try {
+    const ur = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+      headers: { Authorization: `Bearer ${token.access_token}` },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!ur.ok) return res.redirect('/login?google=profile');
+    info = await ur.json();
+  } catch {
+    return res.redirect('/login?google=profile');
+  }
+
+  const email = String(info.email || '').trim().toLowerCase();
+  const sub = String(info.sub || '');
+  if (!email || !sub) return res.redirect('/login?google=email');
+
+  const found = await q(
+    'SELECT id, google_sub FROM users WHERE google_sub = $1 OR email = $2 ORDER BY (google_sub IS NOT NULL) DESC LIMIT 1',
+    [sub, email]
+  );
+
+  let uid = 0;
+  let isNew = false;
+  let welcome = 0;
+  let raw = '';
+  if (found.rows.length) {
+    uid = found.rows[0].id;
+    if (!found.rows[0].google_sub) await q('UPDATE users SET google_sub = $2 WHERE id = $1', [uid, sub]);
+  } else {
+    raw = 'JXK-' + randomToken(20);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const ins = await client.query('INSERT INTO users (email, pass_hash, google_sub) VALUES ($1,$2,$3) RETURNING id', [email, '', sub]);
+      uid = ins.rows[0].id;
+      await client.query('INSERT INTO api_keys (user_id, name, prefix, key_hash) VALUES ($1,$2,$3,$4)', [uid, 'default', raw.slice(0, 12), sha256Hex(raw)]);
+      welcome = await grantWelcome(client, uid);
+      await client.query('COMMIT');
+      isNew = true;
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+      const again = await q('SELECT id FROM users WHERE google_sub = $1 OR email = $2 LIMIT 1', [sub, email]);
+      if (again.rows.length) {
+        uid = again.rows[0].id;
+        raw = '';
+      } else {
+        throw e;
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  if (!uid) return res.redirect('/login?google=token');
+  setCookie(res, 'jx_session', signSession(uid));
+  if (isNew && raw) setCookie(res, 'jx_newkey', raw, 300);
+  if (isNew && welcome > 0) setFlash(res, `ยินดีต้อนรับ — ได้เครดิตทดลอง ฿${welcome.toFixed(0)} ใช้ได้เลย`);
+  res.redirect('/app');
+}));
 
 /* ---------- dashboard ---------- */
 
@@ -409,7 +567,7 @@ app.get('/app/usage.csv', requireLogin, ah(async (req, res) => {
   const cols = [
     ['created_at', 'เวลา'], ['model', 'โมเดล'], ['stream', 'stream'], ['status', 'HTTP'],
     ['prompt_tokens', 'input_tokens'], ['completion_tokens', 'output_tokens'],
-    ['cache_read_tokens', 'cache_read_tokens'], ['cache_write_tokens', 'cache_write_tokens'],
+    ['cache_read_tokens', 'cache_read_tokens'],
     ['cost_thb', 'cost_thb'], ['latency_ms', 'latency_ms'], ['estimated', 'estimated'],
   ];
   const header = cols.map((c) => c[1]).join(',');
@@ -540,13 +698,13 @@ app.get('/admin/settings', requireAdmin, (req, res) => {
 });
 
 app.post('/admin/settings', requireAdmin, ah(async (req, res) => {
-  const allowed = ['promptpay_id', 'promptpay_name', 'price_in_thb', 'price_out_thb', 'price_cache_read_thb', 'price_cache_write_thb', 'max_output_tokens', 'rate_limit_per_min'];
+  const allowed = ['promptpay_id', 'promptpay_name', 'price_in_thb', 'price_out_thb', 'price_cache_read_thb', 'welcome_credit_thb', 'max_output_tokens', 'rate_limit_per_min'];
   const patch = {};
   for (const key of allowed) {
     if (req.body[key] === undefined) continue;
     let value = String(req.body[key]).trim();
     if (key === 'promptpay_id') value = value.replace(/[^0-9]/g, '');
-    if (key.startsWith('price_') || key === 'max_output_tokens' || key === 'rate_limit_per_min') {
+    if (key.startsWith('price_') || key === 'max_output_tokens' || key === 'rate_limit_per_min' || key === 'welcome_credit_thb') {
       const num = Number(value.replace(',', '.'));
       if (!Number.isFinite(num) || num < 0) continue;
       value = String(num);
@@ -585,7 +743,7 @@ app.get('/admin/usage.csv', requireAdmin, ah(async (req, res) => {
   const cols = [
     ['created_at', 'เวลา'], ['email', 'ผู้ใช้'], ['model', 'โมเดล'], ['stream', 'stream'], ['status', 'HTTP'],
     ['prompt_tokens', 'input_tokens'], ['completion_tokens', 'output_tokens'],
-    ['cache_read_tokens', 'cache_read_tokens'], ['cache_write_tokens', 'cache_write_tokens'],
+    ['cache_read_tokens', 'cache_read_tokens'],
     ['cost_thb', 'cost_thb'], ['latency_ms', 'latency_ms'], ['estimated', 'estimated'], ['ip', 'ip'], ['error', 'error'],
   ];
   const header = cols.map((c) => c[1]).join(',');
@@ -669,7 +827,6 @@ app.get('/v1/me', apiAuth, ah(async (req, res) => {
       prompt_tokens: Number(s.prompt_tokens),
       completion_tokens: Number(s.completion_tokens),
       cache_read_tokens: Number(s.cache_read_tokens),
-      cache_write_tokens: Number(s.cache_write_tokens),
       cost_thb: Number(s.cost_thb),
     },
     prices_per_1m: priceTable(),
