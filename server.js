@@ -81,6 +81,10 @@ function priceTable() {
   };
 }
 
+function payReady() {
+  return Boolean(String(settings.promptpay_id || '').trim());
+}
+
 function googleEnabled() {
   return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
 }
@@ -486,15 +490,19 @@ app.post('/app/keys/:id/revoke', requireLogin, ah(async (req, res) => {
 
 app.get('/buy', requireLogin, ah(async (req, res) => {
   const plans = await getPlans();
-  res.type('html').send(V.buyPage({ plans, prices: priceTable(), user: req.user, flash: takeFlash(req, res), model: modelId() }));
+  res.type('html').send(V.buyPage({ plans, prices: priceTable(), user: req.user, flash: takeFlash(req, res), model: modelId(), payReady: payReady() }));
 }));
 
 app.get('/buy/:code', requireLogin, ah(async (req, res) => {
   const plans = await getPlans();
-  res.type('html').send(V.buyPage({ plans, prices: priceTable(), user: req.user, flash: '', model: modelId() }));
+  res.type('html').send(V.buyPage({ plans, prices: priceTable(), user: req.user, flash: '', model: modelId(), payReady: payReady() }));
 }));
 
 app.post('/buy/:code', requireLogin, ah(async (req, res) => {
+  if (!payReady()) {
+    setFlash(res, 'ยังไม่เปิดรับชำระเงินออนไลน์ในขณะนี้ — กรุณาติดต่อฝ่ายบริการลูกค้า');
+    return res.redirect('/buy');
+  }
   const code = String(req.params.code || '').toUpperCase();
   const plan = (await q('SELECT * FROM plans WHERE code = $1 AND active = true', [code])).rows[0];
   if (!plan) return res.status(404).type('html').send(V.errorPage({ title: 'ไม่พบแผนนี้', message: 'เลือกแผน A, B หรือ C', code: 404, user: req.user }));
@@ -613,6 +621,28 @@ app.get('/app/credit', requireLogin, ah(async (req, res) => {
       WHERE user_id = $1 AND status IN ('pending','review') ORDER BY id DESC LIMIT 10`, [req.user.id]
   )).rows;
   res.type('html').send(V.creditPage({ user: req.user, entries, daily, totals, pending, flash: takeFlash(req, res) }));
+}));
+
+app.get('/app/credit.csv', requireLogin, ah(async (req, res) => {
+  const rows = (await q(
+    `SELECT created_at, delta_thb, reason, ref FROM ledger
+      WHERE user_id = $1 AND reason <> 'usage' ORDER BY id DESC LIMIT 1000`, [req.user.id]
+  )).rows;
+  const label = (r) => {
+    const s = String(r || '');
+    if (s === 'welcome') return 'เครดิตทดลอง';
+    if (s.startsWith('topup:')) return 'เติมเครดิตแผน ' + s.slice(6).toUpperCase();
+    return s || 'ปรับเครดิต';
+  };
+  const header = 'เวลา,รายการ,ยอด (บาท),อ้างอิง';
+  const lines = rows.map((r) => {
+    const v = Number(r.delta_thb || 0);
+    const cells = [V.dt(r.created_at), label(r.reason), (v > 0 ? '+' : '') + v.toFixed(4), r.ref || ''];
+    return cells.map((x) => `"${String(x).replace(/"/g, '""')}"`).join(',');
+  });
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="japexisk-credit-${Date.now()}.csv"`);
+  res.send('\uFEFF' + header + '\n' + lines.join('\n') + (lines.length ? '\n' : ''));
 }));
 
 /* ---------- admin ---------- */
