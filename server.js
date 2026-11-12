@@ -15,6 +15,7 @@ const GOOGLE_CLIENT_SECRET = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
 const GOOGLE_REDIRECT = (process.env.GOOGLE_REDIRECT_URI || `${BASE_URL}/auth/google/callback`).trim();
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const MODEL_ID = (process.env.MODEL_ID || 'deepseek-v4.1-flash').trim();
+const UPSTREAM_MODEL_ID = (process.env.UPSTREAM_MODEL_ID || 'deepseek-v4.1-flash-eco').trim();
 
 const app = express();
 app.set('trust proxy', true);
@@ -131,6 +132,25 @@ function rangeWhere(range) {
   return '';
 }
 
+async function dailyStats(userId, mode) {
+  let where = 'true';
+  if (mode === 'today') where = "day = (now() AT TIME ZONE 'Asia/Bangkok')::date";
+  else if (mode === 'week') where = "day >= date_trunc('week', (now() AT TIME ZONE 'Asia/Bangkok'))::date";
+  else if (mode === 'month') where = "day >= date_trunc('month', (now() AT TIME ZONE 'Asia/Bangkok'))::date";
+  else if (mode === '30d') where = "day >= ((now() AT TIME ZONE 'Asia/Bangkok')::date - 30)";
+  const r = await q(
+    `SELECT coalesce(sum(requests),0)::int AS requests,
+            coalesce(sum(prompt_tokens),0)::bigint AS pt,
+            coalesce(sum(completion_tokens),0)::bigint AS ct,
+            coalesce(sum(cache_read_tokens),0)::bigint AS cat,
+            coalesce(sum(cost_thb),0)::numeric AS cost,
+            coalesce(sum(cache_read_tokens),0)::bigint AS cwt
+       FROM usage_daily WHERE user_id = $1 AND ${where}`,
+    [userId]
+  );
+  return r.rows[0];
+}
+
 /* ---------- usage logging ---------- */
 
 async function recordUsage(opts) {
@@ -179,6 +199,17 @@ async function recordUsage(opts) {
     if (costRounded > 0) {
       await client.query('INSERT INTO ledger (user_id, delta_thb, reason, ref) VALUES ($1,$2,$3,$4)', [user.id, -costRounded, 'usage', reqId]);
     }
+    await client.query(
+      `INSERT INTO usage_daily (user_id, day, requests, prompt_tokens, completion_tokens, cache_read_tokens, cost_thb)
+       VALUES ($1, (now() AT TIME ZONE 'Asia/Bangkok')::date, 1, $2, $3, $4, $5)
+       ON CONFLICT (user_id, day) DO UPDATE SET
+         requests = usage_daily.requests + 1,
+         prompt_tokens = usage_daily.prompt_tokens + EXCLUDED.prompt_tokens,
+         completion_tokens = usage_daily.completion_tokens + EXCLUDED.completion_tokens,
+         cache_read_tokens = usage_daily.cache_read_tokens + EXCLUDED.cache_read_tokens,
+         cost_thb = usage_daily.cost_thb + EXCLUDED.cost_thb`,
+      [user.id, pt, ct, cr, costRounded]
+    );
     const r = await client.query('SELECT balance_thb FROM users WHERE id = $1', [user.id]);
     balance = Number(r.rows[0].balance_thb);
     await client.query('COMMIT');
@@ -219,12 +250,13 @@ app.use(ah(async (req, res, next) => {
 /* ---------- public pages ---------- */
 
 app.get('/', ah(async (req, res) => {
+  if (req.user) return res.redirect('/app');
   const plans = await getPlans();
-  res.type('html').send(V.landing({ plans, prices: priceTable(), baseUrl: BASE_URL, google: googleEnabled(), model: modelId() }));
+  res.type('html').send(V.landing({ plans, prices: priceTable(), baseUrl: BASE_URL, google: googleEnabled(), model: modelId(), user: null }));
 }));
 
 app.get('/docs', ah(async (req, res) => {
-  res.type('html').send(V.docsPage({ baseUrl: BASE_URL, model: modelId(), prices: priceTable() }));
+  res.type('html').send(V.docsPage({ baseUrl: BASE_URL, model: modelId(), prices: priceTable(), user: req.user }));
 }));
 
 app.get('/stats', requireAdmin, ah(async (req, res) => {
@@ -396,16 +428,7 @@ app.get('/app', requireLogin, ah(async (req, res) => {
   if (newKey) clearCookie(res, 'jx_newkey');
 
   const keys = (await q('SELECT id, name, prefix, created_at, last_used_at, revoked FROM api_keys WHERE user_id = $1 ORDER BY id DESC', [req.user.id])).rows;
-  const stats = (await q(
-    `SELECT count(*)::int AS requests,
-            coalesce(sum(prompt_tokens),0)::bigint AS pt,
-            coalesce(sum(completion_tokens),0)::bigint AS ct,
-            coalesce(sum(cache_read_tokens),0)::bigint AS cat,
-            coalesce(sum(cache_write_tokens),0)::bigint AS cwt,
-            coalesce(sum(cost_thb),0)::numeric AS cost
-       FROM usage_logs WHERE user_id = $1 AND created_at > now() - interval '30 days'`,
-    [req.user.id]
-  )).rows[0];
+  const stats = await dailyStats(req.user.id, '30d');
   const recent = (await q(
     `SELECT created_at, model, status, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, cost_thb, stream, estimated
        FROM usage_logs WHERE user_id = $1 ORDER BY id DESC LIMIT 8`, [req.user.id]
@@ -519,7 +542,12 @@ app.get('/app/usage', requireLogin, ah(async (req, res) => {
     `SELECT created_at, model, status, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, cost_thb, latency_ms, stream, estimated
        FROM usage_logs WHERE user_id = $1 ${where} ORDER BY id DESC LIMIT 300`, [req.user.id]
   )).rows;
-  res.type('html').send(V.usagePage({ user: req.user, stats, rows, range }));
+  const periods = {
+    today: await dailyStats(req.user.id, 'today'),
+    week: await dailyStats(req.user.id, 'week'),
+    month: await dailyStats(req.user.id, 'month'),
+  };
+  res.type('html').send(V.usagePage({ user: req.user, stats, rows, range, periods }));
 }));
 
 app.get('/app/usage.csv', requireLogin, ah(async (req, res) => {
@@ -809,7 +837,7 @@ app.post('/v1/chat/completions', apiAuth, ah(async (req, res) => {
   const body = req.body || {};
   const p = priceTable();
   const publicModel = modelId();
-  const upstreamModel = modelId();
+  const upstreamModel = UPSTREAM_MODEL_ID || 'deepseek-v4.1-flash-eco';
   const allowedModels = [publicModel, 'deepseek-eco', 'deepseek-v4.1-flash-eco'];
   const stream = body.stream === true;
   const requested = String(body.model || '');
