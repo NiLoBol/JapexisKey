@@ -438,6 +438,13 @@ app.get('/app', requireLogin, ah(async (req, res) => {
       WHERE user_id = $1 ORDER BY id DESC LIMIT 6`, [req.user.id]
   )).rows;
 
+  const bal = Number(req.user.balance_thb || 0);
+  const req30 = Number(stats.requests || 0);
+  const cost30 = Number(stats.cost || 0);
+  const avgCost = req30 >= 3 && cost30 > 0 ? cost30 / req30 : 0;
+  const estRequests = avgCost > 0 ? Math.floor(bal / avgCost) : null;
+  const low = bal <= 0.5 || (estRequests !== null && estRequests < 50);
+
   res.type('html').send(V.dashPage({
     user: req.user,
     keys,
@@ -447,6 +454,7 @@ app.get('/app', requireLogin, ah(async (req, res) => {
     orders,
     baseUrl: BASE_URL,
     model: modelId(),
+    credit: { estRequests, low },
     flash: takeFlash(req, res),
   }));
 }));
@@ -860,7 +868,7 @@ app.post('/v1/chat/completions', apiAuth, ah(async (req, res) => {
       user, key, reqId, model: publicModel, stream, status: 402, upstreamStatus: null,
       fallbackIn: 0, fallbackOut: 0, latencyMs: Date.now() - started, ip, error: 'insufficient credit',
     });
-    return apiError(res, 402, 'เครดิตหมด — เติมที่หน้า /buy', 'insufficient_quota', 'insufficient_quota');
+    return apiError(res, 402, `เครดิตไม่พอ (คงเหลือ ฿${balanceNow.toFixed(2)}) — เติมได้ที่ ${BASE_URL}/buy`, 'insufficient_quota', 'insufficient_quota');
   }
 
   const maxOut = Math.min(
