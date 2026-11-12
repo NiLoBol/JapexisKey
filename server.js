@@ -13,6 +13,7 @@ const COOKIE_SECURE = process.env.COOKIE_SECURE === '0' ? '' : '; Secure';
 const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID || '').trim();
 const GOOGLE_CLIENT_SECRET = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
 const GOOGLE_REDIRECT = (process.env.GOOGLE_REDIRECT_URI || `${BASE_URL}/auth/google/callback`).trim();
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 
 const app = express();
 app.set('trust proxy', true);
@@ -62,10 +63,12 @@ function requireLogin(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  const c = parseCookies(req.headers.cookie).jx_admin;
-  if (readAdmin(c)) return next();
-  if (req.method === 'GET') return res.redirect('/admin/login');
-  return res.status(401).send('unauthorized');
+  if (req.user && req.user.role === 'admin') return next();
+  if (req.method === 'GET') {
+    if (!req.user) return res.redirect('/login');
+    return res.status(403).type('html').send(V.errorPage({ title: 'เฉพาะแอดมิน', message: 'บัญชีนี้ไม่มีสิทธิ์เข้าหน้านี้', code: 403, user: req.user }));
+  }
+  return res.status(403).json({ error: 'admin only' });
 }
 
 function priceTable() {
@@ -219,7 +222,7 @@ app.get('/docs', ah(async (req, res) => {
   res.type('html').send(V.docsPage({ baseUrl: BASE_URL, model: settings.public_model || 'deepseek-eco', prices: priceTable() }));
 }));
 
-app.get('/stats', ah(async (req, res) => {
+app.get('/stats', requireAdmin, ah(async (req, res) => {
   const t0 = Date.now();
   let dbOk = true;
   try { await q('SELECT 1'); } catch { dbOk = false; }
@@ -231,6 +234,7 @@ app.get('/stats', ah(async (req, res) => {
     plans,
     settings,
     baseUrl: BASE_URL,
+    user: req.user,
   }));
 }));
 
@@ -241,77 +245,24 @@ app.get('/api/health', ah(async (req, res) => {
   try { await q('SELECT 1'); res.json({ ok: true, uptime: Math.round(process.uptime()), db: 'ok' }); } catch (e) { res.status(503).json({ ok: false, db: 'down' }); }
 }));
 
-/* ---------- auth pages ---------- */
+/* ---------- auth pages (Google only) ---------- */
 
-app.get('/signup', (req, res) => {
-  res.type('html').send(V.authPage({ mode: 'signup', google: googleEnabled() }));
-});
-
-app.post('/signup', ah(async (req, res) => {
-  const email = String(req.body.email || '').trim().toLowerCase();
-  const password = String(req.body.password || '');
-  if (!signupAllowed(clientIp(req))) {
-    return res.status(429).type('html').send(V.authPage({ mode: 'signup', google: googleEnabled(), error: 'สมัครบ่อยเกินไป — ลองใหม่ภายหลัง' }));
-  }
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
-    return res.status(400).type('html').send(V.authPage({ mode: 'signup', google: googleEnabled(), error: 'อีเมลไม่ถูกต้อง' }));
-  }
-  if (password.length < 8) {
-    return res.status(400).type('html').send(V.authPage({ mode: 'signup', google: googleEnabled(), error: 'รหัสผ่านอย่างน้อย 8 ตัวอักษร' }));
-  }
-  const exists = await q('SELECT 1 FROM users WHERE email = $1', [email]);
-  if (exists.rows.length) {
-    return res.status(409).type('html').send(V.authPage({ mode: 'signup', google: googleEnabled(), error: 'อีเมลนี้สมัครแล้ว — เข้าสู่ระบบได้เลย' }));
-  }
-  const raw = 'JXK-' + randomToken(20);
-  const client = await pool.connect();
-  let uid = 0;
-  let welcome = 0;
-  try {
-    await client.query('BEGIN');
-    const ins = await client.query('INSERT INTO users (email, pass_hash) VALUES ($1,$2) RETURNING id', [email, hashPassword(password)]);
-    uid = ins.rows[0].id;
-    await client.query('INSERT INTO api_keys (user_id, name, prefix, key_hash) VALUES ($1,$2,$3,$4)', [uid, 'default', raw.slice(0, 12), sha256Hex(raw)]);
-    welcome = await grantWelcome(client, uid);
-    await client.query('COMMIT');
-  } catch (e) {
-    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
-    throw e;
-  } finally {
-    client.release();
-  }
-
-  setCookie(res, 'jx_session', signSession(uid));
-  setCookie(res, 'jx_newkey', raw, 300);
-  if (welcome > 0) setFlash(res, `ยินดีต้อนรับ — ได้เครดิตทดลอง ฿${welcome.toFixed(0)} ใช้ได้เลย`);
-  res.redirect('/app');
-}));
+app.get('/signup', (req, res) => res.redirect('/login'));
+app.post('/signup', (req, res) => res.redirect('/login'));
 
 app.get('/login', (req, res) => {
+  if (req.user) return res.redirect('/app');
   const notices = {
-    off: 'Google login ยังไม่เปิด — ใช้เมล/รหัสผ่านไปก่อน',
+    off: 'Google login ยังไม่เปิด — แจ้งแอดมิน',
     state: 'เซสชัน Google หมดอายุ ลองอีกครั้ง',
     token: 'เชื่อมต่อ Google ไม่สำเร็จ ลองอีกครั้ง',
     profile: 'อ่านข้อมูลจาก Google ไม่ได้ ลองอีกครั้ง',
     email: 'บัญชี Google นี้ไม่มีอีเมล',
   };
-  const notice = notices[String(req.query.google || '')] || '';
+  const notice = googleEnabled() ? (notices[String(req.query.google || '')] || '') : notices.off;
   res.type('html').send(V.authPage({ mode: 'login', google: googleEnabled(), notice }));
 });
-
-app.post('/login', ah(async (req, res) => {
-  const email = String(req.body.email || '').trim().toLowerCase();
-  const password = String(req.body.password || '');
-  const r = await q('SELECT id, pass_hash, status FROM users WHERE email = $1', [email]);
-  if (!r.rows.length || !verifyPassword(password, r.rows[0].pass_hash)) {
-    return res.status(401).type('html').send(V.authPage({ mode: 'login', error: 'อีเมลหรือรหัสผ่านไม่ถูกต้อง' }));
-  }
-  if (r.rows[0].status !== 'active') {
-    return res.status(403).type('html').send(V.authPage({ mode: 'login', error: 'บัญชีถูกระงับ' }));
-  }
-  setCookie(res, 'jx_session', signSession(r.rows[0].id));
-  res.redirect('/app');
-}));
+app.post('/login', (req, res) => res.redirect('/login'));
 
 app.post('/logout', (req, res) => {
   clearCookie(res, 'jx_session');
@@ -378,6 +329,7 @@ app.get('/auth/google/callback', ah(async (req, res) => {
   const email = String(info.email || '').trim().toLowerCase();
   const sub = String(info.sub || '');
   if (!email || !sub) return res.redirect('/login?google=email');
+  const isAdminEmail = Boolean(ADMIN_EMAIL) && email === ADMIN_EMAIL;
 
   const found = await q(
     'SELECT id, google_sub FROM users WHERE google_sub = $1 OR email = $2 ORDER BY (google_sub IS NOT NULL) DESC LIMIT 1',
@@ -391,12 +343,13 @@ app.get('/auth/google/callback', ah(async (req, res) => {
   if (found.rows.length) {
     uid = found.rows[0].id;
     if (!found.rows[0].google_sub) await q('UPDATE users SET google_sub = $2 WHERE id = $1', [uid, sub]);
+    await q('UPDATE users SET role = $2 WHERE id = $1', [uid, isAdminEmail ? 'admin' : 'user']);
   } else {
     raw = 'JXK-' + randomToken(20);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const ins = await client.query('INSERT INTO users (email, pass_hash, google_sub) VALUES ($1,$2,$3) RETURNING id', [email, '', sub]);
+      const ins = await client.query('INSERT INTO users (email, pass_hash, google_sub, role) VALUES ($1,$2,$3,$4) RETURNING id', [email, '', sub, isAdminEmail ? 'admin' : 'user']);
       uid = ins.rows[0].id;
       await client.query('INSERT INTO api_keys (user_id, name, prefix, key_hash) VALUES ($1,$2,$3,$4)', [uid, 'default', raw.slice(0, 12), sha256Hex(raw)]);
       welcome = await grantWelcome(client, uid);
@@ -417,6 +370,7 @@ app.get('/auth/google/callback', ah(async (req, res) => {
   }
 
   if (!uid) return res.redirect('/login?google=token');
+  if (isAdminEmail) await q("UPDATE users SET role = 'user' WHERE role = 'admin' AND email <> $1", [ADMIN_EMAIL]);
   setCookie(res, 'jx_session', signSession(uid));
   if (isNew && raw) setCookie(res, 'jx_newkey', raw, 300);
   if (isNew && welcome > 0) setFlash(res, `ยินดีต้อนรับ — ได้เครดิตทดลอง ฿${welcome.toFixed(0)} ใช้ได้เลย`);
@@ -583,21 +537,12 @@ app.get('/app/usage.csv', requireLogin, ah(async (req, res) => {
 
 /* ---------- admin ---------- */
 
-app.get('/admin/login', (req, res) => {
-  res.type('html').send(V.adminLogin({ error: '' }));
-});
-
-app.post('/admin/login', (req, res) => {
-  if (!checkAdminToken(String(req.body.token || ''))) {
-    return res.status(401).type('html').send(V.adminLogin({ error: 'รหัสไม่ถูกต้อง' }));
-  }
-  res.append('Set-Cookie', `jx_admin=${encodeURIComponent(signAdmin())}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200${COOKIE_SECURE}`);
-  res.redirect('/admin');
-});
+app.get('/admin/login', (req, res) => res.redirect('/login'));
+app.post('/admin/login', (req, res) => res.redirect('/login'));
 
 app.post('/admin/logout', (req, res) => {
-  clearCookie(res, 'jx_admin');
-  res.redirect('/admin/login');
+  clearCookie(res, 'jx_session');
+  res.redirect('/');
 });
 
 app.get('/admin', requireAdmin, ah(async (req, res) => {
@@ -619,7 +564,7 @@ app.get('/admin', requireAdmin, ah(async (req, res) => {
             (SELECT coalesce(sum(amount_thb),0) FROM orders WHERE status='paid')::numeric AS revenue,
             (SELECT coalesce(sum(cost_thb),0) FROM usage_logs WHERE created_at > now() - interval '30 days')::numeric AS cost30`
   )).rows[0];
-  res.type('html').send(V.adminHome({ pending, paid, rows, totals, flash: takeFlash(req, res) }));
+  res.type('html').send(V.adminHome({ pending, paid, rows, totals, flash: takeFlash(req, res), user: req.user }));
 }));
 
 app.post('/admin/orders/:id/approve', requireAdmin, ah(async (req, res) => {
@@ -666,7 +611,7 @@ app.get('/admin/users', requireAdmin, ah(async (req, res) => {
             (SELECT coalesce(sum(cost_thb),0) FROM usage_logs l WHERE l.user_id = u.id)::numeric AS spent
        FROM users u ORDER BY u.id DESC LIMIT 200`
   )).rows;
-  res.type('html').send(V.adminUsers({ users, flash: takeFlash(req, res) }));
+  res.type('html').send(V.adminUsers({ users, flash: takeFlash(req, res), user: req.user }));
 }));
 
 app.post('/admin/users/:id/credit', requireAdmin, ah(async (req, res) => {
@@ -694,7 +639,7 @@ app.post('/admin/users/:id/credit', requireAdmin, ah(async (req, res) => {
 }));
 
 app.get('/admin/settings', requireAdmin, (req, res) => {
-  res.type('html').send(V.adminSettings({ settings, flash: takeFlash(req, res) }));
+  res.type('html').send(V.adminSettings({ settings, flash: takeFlash(req, res), user: req.user }));
 });
 
 app.post('/admin/settings', requireAdmin, ah(async (req, res) => {
@@ -731,7 +676,7 @@ app.get('/admin/usage', requireAdmin, ah(async (req, res) => {
             count(*) FILTER (WHERE status >= 400)::int AS errors
        FROM usage_logs WHERE created_at > now() - interval '30 days'`
   )).rows[0];
-  res.type('html').send(V.adminUsage({ rows, totals, flash: takeFlash(req, res) }));
+  res.type('html').send(V.adminUsage({ rows, totals, flash: takeFlash(req, res), user: req.user }));
 }));
 
 app.get('/admin/usage.csv', requireAdmin, ah(async (req, res) => {
