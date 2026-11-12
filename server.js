@@ -14,6 +14,7 @@ const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID || '').trim();
 const GOOGLE_CLIENT_SECRET = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
 const GOOGLE_REDIRECT = (process.env.GOOGLE_REDIRECT_URI || `${BASE_URL}/auth/google/callback`).trim();
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+const MODEL_ID = (process.env.MODEL_ID || 'deepseek-v4.1-flash').trim();
 
 const app = express();
 app.set('trust proxy', true);
@@ -50,7 +51,7 @@ async function currentUser(req) {
   const cookies = parseCookies(req.headers.cookie);
   const uid = readSession(cookies.jx_session);
   if (!uid) return null;
-  const r = await q('SELECT id, email, role, status, balance_thb, created_at FROM users WHERE id = $1', [uid]);
+  const r = await q('SELECT id, email, name, role, status, balance_thb, created_at FROM users WHERE id = $1', [uid]);
   return r.rows[0] || null;
 }
 
@@ -81,6 +82,10 @@ function priceTable() {
 
 function googleEnabled() {
   return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+}
+
+function modelId() {
+  return MODEL_ID || 'deepseek-v4.1-flash';
 }
 
 async function grantWelcome(client, userId) {
@@ -215,11 +220,11 @@ app.use(ah(async (req, res, next) => {
 
 app.get('/', ah(async (req, res) => {
   const plans = await getPlans();
-  res.type('html').send(V.landing({ plans, prices: priceTable(), baseUrl: BASE_URL, google: googleEnabled() }));
+  res.type('html').send(V.landing({ plans, prices: priceTable(), baseUrl: BASE_URL, google: googleEnabled(), model: modelId() }));
 }));
 
 app.get('/docs', ah(async (req, res) => {
-  res.type('html').send(V.docsPage({ baseUrl: BASE_URL, model: settings.public_model || 'deepseek-eco', prices: priceTable() }));
+  res.type('html').send(V.docsPage({ baseUrl: BASE_URL, model: modelId(), prices: priceTable() }));
 }));
 
 app.get('/stats', requireAdmin, ah(async (req, res) => {
@@ -265,6 +270,10 @@ app.get('/login', (req, res) => {
 app.post('/login', (req, res) => res.redirect('/login'));
 
 app.post('/logout', (req, res) => {
+  clearCookie(res, 'jx_session');
+  res.redirect('/');
+});
+app.get('/logout', (req, res) => {
   clearCookie(res, 'jx_session');
   res.redirect('/');
 });
@@ -330,6 +339,7 @@ app.get('/auth/google/callback', ah(async (req, res) => {
   const sub = String(info.sub || '');
   if (!email || !sub) return res.redirect('/login?google=email');
   const isAdminEmail = Boolean(ADMIN_EMAIL) && email === ADMIN_EMAIL;
+  const displayName = String(info.name || '').trim().slice(0, 80);
 
   const found = await q(
     'SELECT id, google_sub FROM users WHERE google_sub = $1 OR email = $2 ORDER BY (google_sub IS NOT NULL) DESC LIMIT 1',
@@ -344,12 +354,13 @@ app.get('/auth/google/callback', ah(async (req, res) => {
     uid = found.rows[0].id;
     if (!found.rows[0].google_sub) await q('UPDATE users SET google_sub = $2 WHERE id = $1', [uid, sub]);
     await q('UPDATE users SET role = $2 WHERE id = $1', [uid, isAdminEmail ? 'admin' : 'user']);
+    if (displayName) await q('UPDATE users SET name = $2 WHERE id = $1', [uid, displayName]);
   } else {
     raw = 'JXK-' + randomToken(20);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const ins = await client.query('INSERT INTO users (email, pass_hash, google_sub, role) VALUES ($1,$2,$3,$4) RETURNING id', [email, '', sub, isAdminEmail ? 'admin' : 'user']);
+      const ins = await client.query('INSERT INTO users (email, pass_hash, google_sub, role, name) VALUES ($1,$2,$3,$4,$5) RETURNING id', [email, '', sub, isAdminEmail ? 'admin' : 'user', displayName || null]);
       uid = ins.rows[0].id;
       await client.query('INSERT INTO api_keys (user_id, name, prefix, key_hash) VALUES ($1,$2,$3,$4)', [uid, 'default', raw.slice(0, 12), sha256Hex(raw)]);
       welcome = await grantWelcome(client, uid);
@@ -412,7 +423,7 @@ app.get('/app', requireLogin, ah(async (req, res) => {
     recent,
     orders,
     baseUrl: BASE_URL,
-    model: settings.public_model || 'deepseek-eco',
+    model: modelId(),
     flash: takeFlash(req, res),
   }));
 }));
@@ -435,12 +446,12 @@ app.post('/app/keys/:id/revoke', requireLogin, ah(async (req, res) => {
 
 app.get('/buy', requireLogin, ah(async (req, res) => {
   const plans = await getPlans();
-  res.type('html').send(V.buyPage({ plans, prices: priceTable(), user: req.user, flash: takeFlash(req, res) }));
+  res.type('html').send(V.buyPage({ plans, prices: priceTable(), user: req.user, flash: takeFlash(req, res), model: modelId() }));
 }));
 
 app.get('/buy/:code', requireLogin, ah(async (req, res) => {
   const plans = await getPlans();
-  res.type('html').send(V.buyPage({ plans, prices: priceTable(), user: req.user, flash: '' }));
+  res.type('html').send(V.buyPage({ plans, prices: priceTable(), user: req.user, flash: '', model: modelId() }));
 }));
 
 app.post('/buy/:code', requireLogin, ah(async (req, res) => {
@@ -519,14 +530,15 @@ app.get('/app/usage.csv', requireLogin, ah(async (req, res) => {
        FROM usage_logs WHERE user_id = $1 ${where} ORDER BY id DESC`, [req.user.id]
   )).rows;
   const cols = [
-    ['created_at', 'เวลา'], ['model', 'โมเดล'], ['stream', 'stream'], ['status', 'HTTP'],
-    ['prompt_tokens', 'input_tokens'], ['completion_tokens', 'output_tokens'],
-    ['cache_read_tokens', 'cache_read_tokens'],
-    ['cost_thb', 'cost_thb'], ['latency_ms', 'latency_ms'], ['estimated', 'estimated'],
+    ['created_at', 'เวลา'], ['model', 'โมเดล'], ['stream', 'สตรีม'], ['status', 'HTTP'],
+    ['prompt_tokens', 'โทเคนเข้า'], ['completion_tokens', 'โทเคนออก'],
+    ['cache_read_tokens', 'โทเคนจากแคช'],
+    ['cost_thb', 'ค่าใช้จ่าย (บาท)'], ['latency_ms', 'เวลาตอบ (ms)'], ['estimated', 'ประมาณการ'],
   ];
   const header = cols.map((c) => c[1]).join(',');
   const lines = rows.map((r) => cols.map((c) => {
     let v = c[0] === 'created_at' ? V.dt(r[c[0]]) : r[c[0]];
+    if (c[0] === 'stream' || c[0] === 'estimated') v = r[c[0]] ? 'ใช่' : 'ไม่ใช่';
     if (v === null || v === undefined) v = '';
     return `"${String(v).replace(/"/g, '""')}"`;
   }).join(','));
@@ -639,7 +651,7 @@ app.post('/admin/users/:id/credit', requireAdmin, ah(async (req, res) => {
 }));
 
 app.get('/admin/settings', requireAdmin, (req, res) => {
-  res.type('html').send(V.adminSettings({ settings, flash: takeFlash(req, res), user: req.user }));
+  res.type('html').send(V.adminSettings({ settings, flash: takeFlash(req, res), user: req.user, model: modelId() }));
 });
 
 app.post('/admin/settings', requireAdmin, ah(async (req, res) => {
@@ -686,14 +698,15 @@ app.get('/admin/usage.csv', requireAdmin, ah(async (req, res) => {
        FROM usage_logs l JOIN users u ON u.id = l.user_id ORDER BY l.id DESC LIMIT 10000`
   )).rows;
   const cols = [
-    ['created_at', 'เวลา'], ['email', 'ผู้ใช้'], ['model', 'โมเดล'], ['stream', 'stream'], ['status', 'HTTP'],
-    ['prompt_tokens', 'input_tokens'], ['completion_tokens', 'output_tokens'],
-    ['cache_read_tokens', 'cache_read_tokens'],
-    ['cost_thb', 'cost_thb'], ['latency_ms', 'latency_ms'], ['estimated', 'estimated'], ['ip', 'ip'], ['error', 'error'],
+    ['created_at', 'เวลา'], ['email', 'ผู้ใช้'], ['model', 'โมเดล'], ['stream', 'สตรีม'], ['status', 'HTTP'],
+    ['prompt_tokens', 'โทเคนเข้า'], ['completion_tokens', 'โทเคนออก'],
+    ['cache_read_tokens', 'โทเคนจากแคช'],
+    ['cost_thb', 'ค่าใช้จ่าย (บาท)'], ['latency_ms', 'เวลาตอบ (ms)'], ['estimated', 'ประมาณการ'], ['ip', 'IP'], ['error', 'error'],
   ];
   const header = cols.map((c) => c[1]).join(',');
   const lines = rows.map((r) => cols.map((c) => {
     let v = c[0] === 'created_at' ? V.dt(r[c[0]]) : r[c[0]];
+    if (c[0] === 'stream' || c[0] === 'estimated') v = r[c[0]] ? 'ใช่' : 'ไม่ใช่';
     if (v === null || v === undefined) v = '';
     return `"${String(v).replace(/"/g, '""')}"`;
   }).join(','));
@@ -739,7 +752,7 @@ async function apiAuth(req, res, next) {
 }
 
 app.get('/v1/models', apiAuth, (req, res) => {
-  const id = settings.public_model || 'deepseek-eco';
+  const id = modelId();
   res.json({
     object: 'list',
     data: [{
@@ -766,7 +779,7 @@ app.get('/v1/me', apiAuth, ah(async (req, res) => {
   res.json({
     account: u.email,
     balance_thb: Number(fresh.balance_thb),
-    model: settings.public_model || 'deepseek-eco',
+    model: modelId(),
     usage_30d: {
       requests: s.requests,
       prompt_tokens: Number(s.prompt_tokens),
@@ -795,22 +808,23 @@ app.post('/v1/chat/completions', apiAuth, ah(async (req, res) => {
   const ip = clientIp(req);
   const body = req.body || {};
   const p = priceTable();
-  const publicModel = settings.public_model || 'deepseek-eco';
-  const upstreamModel = settings.upstream_model || 'deepseek-v4.1-flash-eco';
+  const publicModel = modelId();
+  const upstreamModel = modelId();
+  const allowedModels = [publicModel, 'deepseek-eco', 'deepseek-v4.1-flash-eco'];
   const stream = body.stream === true;
   const requested = String(body.model || '');
 
-  if (requested && ![publicModel, upstreamModel].includes(requested)) {
+  if (requested && !allowedModels.includes(requested)) {
     return apiError(res, 404, `โมเดล "${requested}" ไม่เปิดให้ใช้ — ใช้ "${publicModel}" เท่านั้น`, 'model_not_found', 'model_not_found');
   }
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return apiError(res, 400, 'ต้องมี messages อย่างน้อย 1 รายการ', 'invalid_request_error', 'invalid_messages');
   }
   if (!rateLimitHit(key.id)) {
-    return apiError(res, 429, `ยิงถี่เกินกำหนด (${settings.rate_limit_per_min || 30} ครั้ง/นาที) — ลองใหม่ภายหลัง`, 'rate_limit_error', 'rate_limit_exceeded');
+    return apiError(res, 429, `เรียกใช้งานถี่เกินกำหนด (${settings.rate_limit_per_min || 30} ครั้ง/นาที) — ลองใหม่ภายหลัง`, 'rate_limit_error', 'rate_limit_exceeded');
   }
   if (!UPSTREAM_API_KEY) {
-    return apiError(res, 503, 'ระบบยังไม่ได้ตั้งค่าคีย์ต้นทาง', 'api_error', 'upstream_unconfigured');
+    return apiError(res, 503, 'ระบบไม่พร้อมให้บริการชั่วคราว — ลองใหม่ภายหลัง', 'api_error', 'service_unavailable');
   }
   const balanceNow = Number((await q('SELECT balance_thb FROM users WHERE id = $1', [user.id])).rows[0].balance_thb);
   if (balanceNow <= 0) {
@@ -848,7 +862,7 @@ app.post('/v1/chat/completions', apiAuth, ah(async (req, res) => {
       user, key, reqId, model: publicModel, stream, status: 502, upstreamStatus: null,
       fallbackIn: 0, fallbackOut: 0, latencyMs: Date.now() - started, ip, error: e.message,
     });
-    return apiError(res, 502, 'เชื่อมต่อต้นทางไม่สำเร็จ: ' + e.message, 'api_error', 'upstream_unreachable');
+    return apiError(res, 502, 'เชื่อมต่อระบบไม่สำเร็จ — ลองใหม่ภายหลัง', 'api_error', 'upstream_unreachable');
   }
 
   if (!upstream.ok && !stream) {
@@ -964,9 +978,9 @@ app.use((req, res, next) => {
 app.use((err, req, res, next) => {
   console.error('ERROR', req.method, req.path, err.message);
   if (req.path.startsWith('/v1/')) {
-    return apiError(res, 500, 'เกิดข้อผิดพลาดภายใน: ' + err.message, 'api_error', 'internal_error');
+    return apiError(res, 500, 'เกิดข้อผิดพลาดชั่วคราว — ลองใหม่อีกครั้ง', 'api_error', 'internal_error');
   }
-  res.status(500).type('html').send(V.errorPage({ title: 'เกิดข้อผิดพลาด', message: err.message, code: 500, user: req.user }));
+  res.status(500).type('html').send(V.errorPage({ title: 'เกิดข้อผิดพลาด', message: 'ลองใหม่อีกครั้ง หรือติดต่อทีมงาน', code: 500, user: req.user }));
 });
 
 /* ---------- boot ---------- */
