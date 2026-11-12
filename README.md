@@ -1,6 +1,6 @@
 # JapexisKey
 
-เว็บขายคีย์ API (OpenAI-compatible) ราคาเป็นบาท — โมเดลเดียว `deepseek-eco`
+เว็บขายคีย์ API (OpenAI-compatible) ราคาเป็นบาท — โมเดลเดียว `deepseek-v4.1-flash` (DeepSeek V4.1 Flash)
 มีเครดิตทดลอง ฿10, PromptPay QR, log usage ครบ (input / output / cache read)
 
 ## Stack
@@ -22,6 +22,8 @@
 | `GOOGLE_CLIENT_ID` | – | จาก Google Cloud Console (Web application) |
 | `GOOGLE_CLIENT_SECRET` | – | คู่กับ client id |
 | `GOOGLE_REDIRECT_URI` | – | default `<PUBLIC_BASE_URL>/auth/google/callback` |
+| `ADMIN_EMAIL` | – | อีเมล Google ที่เป็นแอดมิน (role=admin อัตโนมัติ) |
+| `MODEL_ID` | – | default `deepseek-v4.1-flash` (ชื่อโมเดลที่ขาย/ส่งต้นทาง) |
 | `COOKIE_SECURE` | – | `0` = ปิด Secure cookie (เฉพาะทดสอบ http) |
 | `PORT` | – | default 3000 |
 
@@ -50,7 +52,7 @@
 curl https://<domain>/v1/chat/completions \
   -H "Authorization: Bearer JXK-xxxxx" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-eco","messages":[{"role":"user","content":"สวัสดี"}],"max_tokens":512}'
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"สวัสดี"}],"max_tokens":512}'
 ```
 - `GET /v1/models`, `GET /v1/me`, `GET /v1/usage`
 - รองรับ `stream: true` (บังคับ `stream_options.include_usage` ให้)
