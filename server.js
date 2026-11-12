@@ -442,7 +442,16 @@ app.get('/app', requireLogin, ah(async (req, res) => {
   const req30 = Number(stats.requests || 0);
   const cost30 = Number(stats.cost || 0);
   const avgCost = req30 >= 10 && cost30 > 0 ? cost30 / req30 : 0;
-  const estRequests = avgCost > 0 ? Math.floor(bal / avgCost) : null;
+  const lastCost = recent.map((r) => Number(r.cost_thb || 0)).find((c) => c > 0) || 0;
+  let estRequests = null;
+  let estBasis = null;
+  if (avgCost > 0) {
+    estRequests = Math.floor(bal / avgCost);
+    estBasis = 'avg30';
+  } else if (lastCost > 0) {
+    estRequests = Math.floor(bal / lastCost);
+    estBasis = 'last';
+  }
   const low = bal <= 0.5 || (estRequests !== null && estRequests < 50);
 
   res.type('html').send(V.dashPage({
@@ -583,6 +592,29 @@ app.get('/app/usage.csv', requireLogin, ah(async (req, res) => {
   res.send('\uFEFF' + header + '\n' + lines.join('\n') + (lines.length ? '\n' : ''));
 }));
 
+/* ---------- credit history ---------- */
+
+app.get('/app/credit', requireLogin, ah(async (req, res) => {
+  const entries = (await q(
+    `SELECT created_at, delta_thb, reason, ref FROM ledger
+      WHERE user_id = $1 AND reason <> 'usage' ORDER BY id DESC LIMIT 100`, [req.user.id]
+  )).rows;
+  const daily = (await q(
+    `SELECT day, requests, cost_thb FROM usage_daily
+      WHERE user_id = $1 ORDER BY day DESC LIMIT 30`, [req.user.id]
+  )).rows;
+  const totals = (await q(
+    `SELECT coalesce(sum(delta_thb) FILTER (WHERE delta_thb > 0),0)::numeric AS added,
+            coalesce(sum(-delta_thb) FILTER (WHERE delta_thb < 0),0)::numeric AS spent
+       FROM ledger WHERE user_id = $1 AND created_at > now() - interval '30 days'`, [req.user.id]
+  )).rows[0];
+  const pending = (await q(
+    `SELECT ref, plan_code, amount_thb, credit_thb, status, created_at FROM orders
+      WHERE user_id = $1 AND status IN ('pending','review') ORDER BY id DESC LIMIT 10`, [req.user.id]
+  )).rows;
+  res.type('html').send(V.creditPage({ user: req.user, entries, daily, totals, pending, flash: takeFlash(req, res) }));
+}));
+
 /* ---------- admin ---------- */
 
 app.get('/admin/login', (req, res) => res.redirect('/login'));
@@ -626,9 +658,9 @@ app.post('/admin/orders/:id/approve', requireAdmin, ah(async (req, res) => {
       setFlash(res, 'ไม่พบออเดอร์');
       return res.redirect('/admin');
     }
-    if (o.status === 'paid') {
+    if (o.status !== 'pending' && o.status !== 'review') {
       await client.query('ROLLBACK');
-      setFlash(res, 'ออเดอร์นี้ชำระแล้ว');
+      setFlash(res, o.status === 'paid' ? 'คำสั่งซื้อนี้ชำระแล้ว' : `อนุมัติได้เฉพาะคำสั่งซื้อที่รอตรวจสอบ (สถานะปัจจุบัน: ${o.status})`);
       return res.redirect('/admin');
     }
     await client.query(`UPDATE orders SET status='paid', paid_at=now(), updated_at=now(), approved_by='admin' WHERE id=$1`, [id]);
