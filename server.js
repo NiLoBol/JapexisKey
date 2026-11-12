@@ -416,7 +416,7 @@ app.get('/auth/google/callback', ah(async (req, res) => {
   if (isAdminEmail) await q("UPDATE users SET role = 'user' WHERE role = 'admin' AND email <> $1", [ADMIN_EMAIL]);
   setCookie(res, 'jx_session', signSession(uid));
   if (isNew && raw) setCookie(res, 'jx_newkey', raw, 300);
-  if (isNew && welcome > 0) setFlash(res, `ยินดีต้อนรับ — ได้เครดิตทดลอง ฿${welcome.toFixed(0)} ใช้ได้เลย`);
+  if (isNew && welcome > 0) setFlash(res, `ยินดีต้อนรับ เครดิตทดลอง ฿${welcome.toFixed(0)} ถูกเพิ่มเข้าบัญชีแล้ว`);
   res.redirect('/app');
 }));
 
