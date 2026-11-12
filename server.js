@@ -441,7 +441,7 @@ app.get('/app', requireLogin, ah(async (req, res) => {
   const bal = Number(req.user.balance_thb || 0);
   const req30 = Number(stats.requests || 0);
   const cost30 = Number(stats.cost || 0);
-  const avgCost = req30 >= 3 && cost30 > 0 ? cost30 / req30 : 0;
+  const avgCost = req30 >= 10 && cost30 > 0 ? cost30 / req30 : 0;
   const estRequests = avgCost > 0 ? Math.floor(bal / avgCost) : null;
   const low = bal <= 0.5 || (estRequests !== null && estRequests < 50);
 
