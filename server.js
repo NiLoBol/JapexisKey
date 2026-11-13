@@ -285,6 +285,10 @@ app.get('/privacy', ah(async (req, res) => {
   res.type('html').send(V.privacyPage({ user: req.user }));
 }));
 
+app.get('/help', ah(async (req, res) => {
+  res.type('html').send(V.helpPage({ user: req.user, payReady: payReady(), model: modelId(), baseUrl: BASE_URL }));
+}));
+
 app.get('/docs', ah(async (req, res) => {
   res.type('html').send(V.docsPage({ baseUrl: BASE_URL, model: modelId(), prices: priceTable(), user: req.user }));
 }));
