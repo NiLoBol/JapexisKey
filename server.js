@@ -264,6 +264,14 @@ app.get('/pricing', ah(async (req, res) => {
   res.type('html').send(V.pricingPage({ plans, prices: priceTable(), user: req.user, payReady: payReady(), model: modelId(), flash: takeFlash(req, res) }));
 }));
 
+app.get('/status', ah(async (req, res) => {
+  const t0 = Date.now();
+  let dbOk = true;
+  try { await q('SELECT 1'); } catch { dbOk = false; }
+  const dbMs = Date.now() - t0;
+  res.type('html').send(V.statusPage({ dbOk, dbMs, model: modelId(), prices: priceTable(), payReady: payReady(), baseUrl: BASE_URL, upstream: Boolean(UPSTREAM_API_KEY), user: req.user }));
+}));
+
 app.get('/docs', ah(async (req, res) => {
   res.type('html').send(V.docsPage({ baseUrl: BASE_URL, model: modelId(), prices: priceTable(), user: req.user }));
 }));
@@ -721,12 +729,65 @@ app.post('/admin/orders/:id/reject', requireAdmin, ah(async (req, res) => {
 
 app.get('/admin/users', requireAdmin, ah(async (req, res) => {
   const users = (await q(
-    `SELECT u.id, u.email, u.balance_thb, u.created_at, u.role, u.status,
+    `SELECT u.id, u.email, u.balance_thb, u.created_at, u.role, u.status, u.status_at, u.status_note,
             (SELECT count(*) FROM usage_logs l WHERE l.user_id = u.id)::int AS requests,
             (SELECT coalesce(sum(cost_thb),0) FROM usage_logs l WHERE l.user_id = u.id)::numeric AS spent
        FROM users u ORDER BY u.id DESC LIMIT 200`
   )).rows;
   res.type('html').send(V.adminUsers({ users, flash: takeFlash(req, res), user: req.user }));
+}));
+
+app.post('/admin/users/:id/suspend', requireAdmin, ah(async (req, res) => {
+  const uid = Number(req.params.id);
+  if (!Number.isInteger(uid) || uid <= 0) {
+    setFlash(res, 'ไม่พบผู้ใช้');
+    return res.redirect('/admin/users');
+  }
+  if (uid === req.user.id) {
+    setFlash(res, 'ระงับบัญชีของตัวเองไม่ได้');
+    return res.redirect('/admin/users');
+  }
+  const note = String((req.body && req.body.note) || '').trim().slice(0, 200);
+  try {
+    const r = await q(
+      `UPDATE users SET status='suspended', status_at=now(), status_by=$2, status_note=$3
+         WHERE id=$1 AND status <> 'suspended' AND role <> 'admin' RETURNING email`,
+      [uid, req.user.id, note || null]
+    );
+    if (!r.rows.length) {
+      const t = (await q('SELECT email, role, status FROM users WHERE id=$1', [uid])).rows[0];
+      setFlash(res, !t ? 'ไม่พบผู้ใช้' : t.role === 'admin' ? 'บัญชีแอดมินระงับไม่ได้' : 'บัญชีนี้ถูกระงับอยู่แล้ว');
+    } else {
+      setFlash(res, `ระงับ ${r.rows[0].email} แล้ว — คีย์เดิมจะตอบ 403 จนกว่าจะคืนสิทธิ์`);
+    }
+  } catch (e) {
+    setFlash(res, 'ระงับไม่สำเร็จ: ' + e.message);
+  }
+  res.redirect('/admin/users');
+}));
+
+app.post('/admin/users/:id/unsuspend', requireAdmin, ah(async (req, res) => {
+  const uid = Number(req.params.id);
+  if (!Number.isInteger(uid) || uid <= 0) {
+    setFlash(res, 'ไม่พบผู้ใช้');
+    return res.redirect('/admin/users');
+  }
+  try {
+    const r = await q(
+      `UPDATE users SET status='active', status_at=now(), status_by=$2, status_note=NULL
+         WHERE id=$1 AND status <> 'active' AND role <> 'admin' RETURNING email`,
+      [uid, req.user.id]
+    );
+    if (!r.rows.length) {
+      const t = (await q('SELECT email, role, status FROM users WHERE id=$1', [uid])).rows[0];
+      setFlash(res, !t ? 'ไม่พบผู้ใช้' : t.role === 'admin' ? 'บัญชีแอดมินไม่ต้องคืนสิทธิ์' : 'บัญชีนี้ใช้งานได้อยู่แล้ว');
+    } else {
+      setFlash(res, `คืนสิทธิ์ ${r.rows[0].email} แล้ว — คีย์เดิมใช้ได้ทันที`);
+    }
+  } catch (e) {
+    setFlash(res, 'คืนสิทธิ์ไม่สำเร็จ: ' + e.message);
+  }
+  res.redirect('/admin/users');
 }));
 
 app.post('/admin/users/:id/credit', requireAdmin, ah(async (req, res) => {
