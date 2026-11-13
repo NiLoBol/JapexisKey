@@ -2,7 +2,7 @@ import express from 'express';
 import crypto from 'node:crypto';
 import { pool, q, initDb, loadSettings, saveSettings, getPlans } from './lib/db.js';
 import { sha256Hex, randomToken, hashPassword, verifyPassword, signSession, readSession, signAdmin, readAdmin, checkAdminToken, parseCookies, makeOrderRef } from './lib/auth.js';
-import { promptPayPayload, qrSvg } from './lib/pay.js';
+import { promptPayPayload, qrSvg, validPromptPayId } from './lib/pay.js';
 import * as V from './lib/views.js';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -91,7 +91,7 @@ function priceTable() {
 }
 
 function payReady() {
-  return Boolean(String(settings.promptpay_id || '').trim());
+  return validPromptPayId(settings.promptpay_id);
 }
 
 function googleEnabled() {
@@ -611,7 +611,7 @@ app.get('/order/:ref', requireLogin, ah(async (req, res) => {
       console.error('qr error', e.message);
     }
   }
-  res.type('html').send(V.orderPage({ order, user: req.user, qr, settings, flash: takeFlash(req, res) }));
+  res.type('html').send(V.orderPage({ order, user: req.user, qr, settings, flash: takeFlash(req, res), payReady: payReady() }));
 }));
 
 app.post('/order/:ref/notify', requireLogin, ah(async (req, res) => {
@@ -899,17 +899,28 @@ app.post('/admin/support/:id/reopen', requireAdmin, ah(async (req, res) => {
   res.redirect('/admin/support');
 }));
 
-app.get('/admin/settings', requireAdmin, (req, res) => {
-  res.type('html').send(V.adminSettings({ settings, flash: takeFlash(req, res), user: req.user, model: modelId() }));
-});
+app.get('/admin/settings', requireAdmin, ah(async (req, res) => {
+  const id = String(settings.promptpay_id || '');
+  const promptpayValid = validPromptPayId(id);
+  let qrPreview = null;
+  if (promptpayValid) {
+    try { qrPreview = await qrSvg(promptPayPayload(id, 10, 'PREVIEW'), 180); } catch { qrPreview = null; }
+  }
+  res.type('html').send(V.adminSettings({ settings, flash: takeFlash(req, res), user: req.user, model: modelId(), promptpayValid, qrPreview }));
+}));
 
 app.post('/admin/settings', requireAdmin, ah(async (req, res) => {
   const allowed = ['promptpay_id', 'promptpay_name', 'price_in_thb', 'price_out_thb', 'price_cache_read_thb', 'welcome_credit_thb', 'max_output_tokens', 'rate_limit_per_min'];
   const patch = {};
+  let badPromptPay = false;
   for (const key of allowed) {
     if (req.body[key] === undefined) continue;
     let value = String(req.body[key]).trim();
-    if (key === 'promptpay_id') value = value.replace(/[^0-9]/g, '');
+    if (key === 'promptpay_id') {
+      const digits = value.replace(/[^0-9]/g, '');
+      if (digits !== '' && !validPromptPayId(digits)) { badPromptPay = true; continue; }
+      value = digits;
+    }
     if (key.startsWith('price_') || key === 'max_output_tokens' || key === 'rate_limit_per_min' || key === 'welcome_credit_thb') {
       const num = Number(value.replace(',', '.'));
       if (!Number.isFinite(num) || num < 0) continue;
@@ -919,7 +930,9 @@ app.post('/admin/settings', requireAdmin, ah(async (req, res) => {
   }
   await saveSettings(patch);
   settings = await loadSettings();
-  setFlash(res, 'บันทึกการตั้งค่าแล้ว');
+  setFlash(res, badPromptPay
+    ? 'เลขพร้อมเพย์ไม่ถูกต้อง — ต้องเป็นเบอร์มือถือ 10 หลักที่ขึ้นต้นด้วย 0 หรือเลข 13 หลัก (ยังไม่บันทึกเลขใหม่)'
+    : 'บันทึกการตั้งค่าแล้ว');
   res.redirect('/admin/settings');
 }));
 
