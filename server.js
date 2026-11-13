@@ -256,7 +256,12 @@ app.use(ah(async (req, res, next) => {
 app.get('/', ah(async (req, res) => {
   if (req.user) return res.redirect('/app');
   const plans = await getPlans();
-  res.type('html').send(V.landing({ plans, prices: priceTable(), baseUrl: BASE_URL, google: googleEnabled(), model: modelId(), user: null }));
+  res.type('html').send(V.landing({ plans, prices: priceTable(), baseUrl: BASE_URL, google: googleEnabled(), model: modelId(), user: null, payReady: payReady() }));
+}));
+
+app.get('/pricing', ah(async (req, res) => {
+  const plans = await getPlans();
+  res.type('html').send(V.pricingPage({ plans, prices: priceTable(), user: req.user, payReady: payReady(), model: modelId(), flash: takeFlash(req, res) }));
 }));
 
 app.get('/docs', ah(async (req, res) => {
