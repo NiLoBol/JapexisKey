@@ -301,7 +301,14 @@ app.get('/privacy', ah(async (req, res) => {
 }));
 
 app.get('/help', ah(async (req, res) => {
-  res.type('html').send(V.helpPage({ user: req.user, payReady: payReady(), model: modelId(), baseUrl: BASE_URL, flash: takeFlash(req, res) }));
+  let messages = [];
+  if (req.user) {
+    messages = (await q(
+      `SELECT id, topic, message, status, created_at FROM support_messages
+        WHERE user_id = $1 ORDER BY id DESC LIMIT 5`, [req.user.id]
+    )).rows;
+  }
+  res.type('html').send(V.helpPage({ user: req.user, payReady: payReady(), model: modelId(), baseUrl: BASE_URL, flash: takeFlash(req, res), messages }));
 }));
 
 app.post('/help/message', ah(async (req, res) => {
@@ -741,7 +748,8 @@ app.get('/admin', requireAdmin, ah(async (req, res) => {
     `SELECT (SELECT count(*) FROM users)::int AS users,
             (SELECT coalesce(sum(balance_thb),0) FROM users)::numeric AS balance,
             (SELECT coalesce(sum(amount_thb),0) FROM orders WHERE status='paid')::numeric AS revenue,
-            (SELECT coalesce(sum(cost_thb),0) FROM usage_logs WHERE created_at > now() - interval '30 days')::numeric AS cost30`
+            (SELECT coalesce(sum(cost_thb),0) FROM usage_logs WHERE created_at > now() - interval '30 days')::numeric AS cost30,
+            (SELECT count(*) FROM support_messages WHERE status <> 'closed')::int AS open_tickets`
   )).rows[0];
   res.type('html').send(V.adminHome({ pending, paid, rows, totals, flash: takeFlash(req, res), user: req.user }));
 }));
