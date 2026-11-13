@@ -110,12 +110,26 @@ function modelId() {
   return MODEL_ID || 'deepseek-v4.1-flash';
 }
 
-async function grantWelcome(client, userId) {
+async function grantWelcome(client, userId, ip) {
   const amount = Number(settings.welcome_credit_thb || 0);
-  if (!(amount > 0)) return 0;
+  if (!(amount > 0)) return { amount: 0, blocked: false };
+  if (ip && ip !== 'unknown') {
+    try {
+      const claim = await client.query(
+        `INSERT INTO welcome_grants (ip, user_id) VALUES ($1, $2)
+         ON CONFLICT (ip) DO UPDATE SET granted_at = now(), user_id = EXCLUDED.user_id
+         WHERE welcome_grants.granted_at < now() - interval '30 days'
+         RETURNING ip`,
+        [ip, userId]
+      );
+      if (!claim.rows.length) return { amount: 0, blocked: true };
+    } catch (e) {
+      console.error('welcome guard failed', e.message);
+    }
+  }
   await client.query('UPDATE users SET balance_thb = balance_thb + $2::numeric WHERE id = $1', [userId, amount]);
   await client.query('INSERT INTO ledger (user_id, delta_thb, reason) VALUES ($1,$2,$3)', [userId, amount, 'welcome']);
-  return amount;
+  return { amount, blocked: false };
 }
 
 const signupHits = new Map();
@@ -493,6 +507,7 @@ app.get('/auth/google/callback', ah(async (req, res) => {
   if (!email || !sub) return res.redirect('/login?google=email');
   const isAdminEmail = Boolean(ADMIN_EMAIL) && email === ADMIN_EMAIL;
   const displayName = String(info.name || '').trim().slice(0, 80);
+  const signupIp = clientIp(req);
 
   const found = await q(
     'SELECT id, google_sub FROM users WHERE google_sub = $1 OR email = $2 ORDER BY (google_sub IS NOT NULL) DESC LIMIT 1',
@@ -502,6 +517,7 @@ app.get('/auth/google/callback', ah(async (req, res) => {
   let uid = 0;
   let isNew = false;
   let welcome = 0;
+  let welcomeBlocked = false;
   let raw = '';
   if (found.rows.length) {
     uid = found.rows[0].id;
@@ -516,7 +532,9 @@ app.get('/auth/google/callback', ah(async (req, res) => {
       const ins = await client.query('INSERT INTO users (email, pass_hash, google_sub, role, name) VALUES ($1,$2,$3,$4,$5) RETURNING id', [email, '', sub, isAdminEmail ? 'admin' : 'user', displayName || null]);
       uid = ins.rows[0].id;
       await client.query('INSERT INTO api_keys (user_id, name, prefix, key_hash) VALUES ($1,$2,$3,$4)', [uid, 'default', raw.slice(0, 12), sha256Hex(raw)]);
-      welcome = await grantWelcome(client, uid);
+      const w = await grantWelcome(client, uid, signupIp);
+      welcome = w.amount;
+      welcomeBlocked = w.blocked;
       await client.query('COMMIT');
       isNew = true;
     } catch (e) {
@@ -538,6 +556,7 @@ app.get('/auth/google/callback', ah(async (req, res) => {
   setCookie(res, 'jx_session', signSession(uid));
   if (isNew && raw) setCookie(res, 'jx_newkey', raw, 300);
   if (isNew && welcome > 0) setFlash(res, `ยินดีต้อนรับ เครดิตทดลอง ฿${welcome.toFixed(0)} ถูกเพิ่มเข้าบัญชีแล้ว`);
+  else if (isNew && welcomeBlocked) setFlash(res, 'สร้างบัญชีแล้ว — บัญชีนี้ยังไม่ได้รับเครดิตทดลอง เนื่องจากอุปกรณ์/IP นี้เคยรับสิทธิ์ทดลองภายใน 30 วัน (สิทธิ์ทดลองให้หนึ่งครั้งต่อผู้ใช้/อุปกรณ์)');
   res.redirect('/app');
 }));
 
