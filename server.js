@@ -696,11 +696,11 @@ app.get('/app/usage.csv', requireLogin, ah(async (req, res) => {
   const range = ['7', '30', 'all'].includes(String(req.query.range)) ? String(req.query.range) : '30';
   const where = rangeWhere(range);
   const rows = (await q(
-    `SELECT created_at, model, stream, status, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, cost_thb, latency_ms, estimated, error
+    `SELECT created_at, request_id, model, stream, status, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, cost_thb, latency_ms, estimated, error
        FROM usage_logs WHERE user_id = $1 ${where} ORDER BY id DESC`, [req.user.id]
   )).rows;
   const cols = [
-    ['created_at', 'เวลา'], ['model', 'โมเดล'], ['stream', 'สตรีม'], ['status', 'HTTP'],
+    ['created_at', 'เวลา'], ['request_id', 'รหัสคำขอ'], ['model', 'โมเดล'], ['stream', 'สตรีม'], ['status', 'HTTP'],
     ['prompt_tokens', 'โทเคนเข้า'], ['completion_tokens', 'โทเคนออก'],
     ['cache_read_tokens', 'โทเคนจากแคช'],
     ['cost_thb', 'ค่าใช้จ่าย (บาท)'], ['latency_ms', 'เวลาตอบ (ms)'], ['estimated', 'ประมาณการ'],
@@ -1015,12 +1015,12 @@ app.get('/admin/usage', requireAdmin, ah(async (req, res) => {
 
 app.get('/admin/usage.csv', requireAdmin, ah(async (req, res) => {
   const rows = (await q(
-    `SELECT l.created_at, u.email, l.model, l.stream, l.status, l.prompt_tokens, l.completion_tokens,
+    `SELECT l.created_at, l.request_id, u.email, l.model, l.stream, l.status, l.prompt_tokens, l.completion_tokens,
             l.cache_read_tokens, l.cache_write_tokens, l.cost_thb, l.latency_ms, l.estimated, l.ip, l.error
        FROM usage_logs l JOIN users u ON u.id = l.user_id ORDER BY l.id DESC LIMIT 10000`
   )).rows;
   const cols = [
-    ['created_at', 'เวลา'], ['email', 'ผู้ใช้'], ['model', 'โมเดล'], ['stream', 'สตรีม'], ['status', 'HTTP'],
+    ['created_at', 'เวลา'], ['request_id', 'รหัสคำขอ'], ['email', 'ผู้ใช้'], ['model', 'โมเดล'], ['stream', 'สตรีม'], ['status', 'HTTP'],
     ['prompt_tokens', 'โทเคนเข้า'], ['completion_tokens', 'โทเคนออก'],
     ['cache_read_tokens', 'โทเคนจากแคช'],
     ['cost_thb', 'ค่าใช้จ่าย (บาท)'], ['latency_ms', 'เวลาตอบ (ms)'], ['estimated', 'ประมาณการ'], ['ip', 'IP'], ['error', 'error'],
