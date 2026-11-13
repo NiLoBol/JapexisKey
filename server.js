@@ -140,6 +140,31 @@ function supportAllowed(userId) {
   return b.count <= 3;
 }
 
+const guestHits = new Map();
+function guestAllowed(ip) {
+  const now = Date.now();
+  let b = guestHits.get(ip);
+  if (!b || now - b.start > 3600000) {
+    b = { start: now, count: 0 };
+    guestHits.set(ip, b);
+  }
+  b.count += 1;
+  if (guestHits.size > 5000) {
+    for (const [k, v] of guestHits) if (now - v.start > 3600000) guestHits.delete(k);
+  }
+  return b.count <= 2;
+}
+
+const EMAIL_RE = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+function cleanEmail(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (s.length < 6 || s.length > 254) return null;
+  if (/[\r\n\0]/.test(s)) return null;
+  if (!EMAIL_RE.test(s)) return null;
+  const domain = s.split('@')[1] || '';
+  return domain.includes('.') ? s : null;
+}
+
 function apiError(res, status, message, type = 'invalid_request_error', code = null) {
   return res.status(status).json({ error: { message, type, code } });
 }
@@ -293,7 +318,7 @@ app.get('/status', ah(async (req, res) => {
   let dbOk = true;
   try { await q('SELECT 1'); } catch { dbOk = false; }
   const dbMs = Date.now() - t0;
-  res.type('html').send(V.statusPage({ dbOk, dbMs, model: modelId(), prices: priceTable(), payReady: payReady(), baseUrl: BASE_URL, upstream: Boolean(UPSTREAM_API_KEY), user: req.user }));
+  res.type('html').send(V.statusPage({ dbOk, dbMs, model: modelId(), prices: priceTable(), payReady: payReady(), baseUrl: BASE_URL, upstream: Boolean(UPSTREAM_API_KEY), uptime: process.uptime(), user: req.user }));
 }));
 
 app.get('/privacy', ah(async (req, res) => {
@@ -312,8 +337,14 @@ app.get('/help', ah(async (req, res) => {
 }));
 
 app.post('/help/message', ah(async (req, res) => {
-  if (!req.user) {
-    setFlash(res, 'กรุณาเข้าสู่ระบบก่อนส่งข้อความ');
+  const isGuest = !req.user;
+  const email = req.user ? req.user.email : cleanEmail(req.body && req.body.email);
+  if (!email) {
+    setFlash(res, 'อีเมลไม่ถูกต้อง — กรุณากรอกอีเมลสำหรับติดต่อกลับ');
+    return res.redirect('/help');
+  }
+  if (String((req.body && req.body.website) || '').trim()) {
+    setFlash(res, 'ส่งข้อความถึงฝ่ายบริการลูกค้าแล้ว');
     return res.redirect('/help');
   }
   const topics = ['api', 'billing', 'key', 'other'];
@@ -323,15 +354,17 @@ app.post('/help/message', ah(async (req, res) => {
     setFlash(res, 'ข้อความสั้นเกินไป — กรุณาเขียนอย่างน้อย 10 ตัวอักษร');
     return res.redirect('/help');
   }
-  if (!supportAllowed(req.user.id)) {
-    setFlash(res, 'ส่งข้อความบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่');
+  if (isGuest ? !guestAllowed(clientIp(req)) : !supportAllowed(req.user.id)) {
+    setFlash(res, isGuest ? 'ส่งข้อความบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่ (สูงสุด 2 ข้อความ/ชั่วโมง)' : 'ส่งข้อความบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่');
     return res.redirect('/help');
   }
   await q(
     'INSERT INTO support_messages (user_id, email, topic, message, ip) VALUES ($1,$2,$3,$4,$5)',
-    [req.user.id, req.user.email, topic, message, clientIp(req)]
+    [req.user ? req.user.id : null, email, topic, message, clientIp(req)]
   );
-  setFlash(res, 'ส่งข้อความถึงฝ่ายบริการลูกค้าแล้ว — จะตอบกลับทางอีเมล');
+  setFlash(res, isGuest
+    ? 'ส่งข้อความถึงฝ่ายบริการลูกค้าแล้ว — จะตอบกลับทางอีเมลที่ให้ไว้'
+    : 'ส่งข้อความถึงฝ่ายบริการลูกค้าแล้ว — จะตอบกลับทางอีเมล');
   res.redirect('/help');
 }));
 
@@ -880,7 +913,7 @@ app.post('/admin/users/:id/credit', requireAdmin, ah(async (req, res) => {
 
 app.get('/admin/support', requireAdmin, ah(async (req, res) => {
   const rows = (await q(
-    `SELECT s.id, s.email, s.topic, s.message, s.status, s.created_at, u.status AS user_status
+    `SELECT s.id, s.user_id, s.email, s.topic, s.message, s.status, s.created_at, u.status AS user_status
        FROM support_messages s LEFT JOIN users u ON u.id = s.user_id
       ORDER BY s.id DESC LIMIT 200`
   )).rows;
