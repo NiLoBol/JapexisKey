@@ -329,7 +329,7 @@ app.get('/help', ah(async (req, res) => {
   let messages = [];
   if (req.user) {
     messages = (await q(
-      `SELECT id, topic, message, status, created_at FROM support_messages
+      `SELECT id, topic, message, status, reply_text, replied_at, created_at FROM support_messages
         WHERE user_id = $1 ORDER BY id DESC LIMIT 5`, [req.user.id]
     )).rows;
   }
@@ -369,7 +369,7 @@ app.post('/help/message', ah(async (req, res) => {
 }));
 
 app.get('/docs', ah(async (req, res) => {
-  res.type('html').send(V.docsPage({ baseUrl: BASE_URL, model: modelId(), prices: priceTable(), user: req.user }));
+  res.type('html').send(V.docsPage({ baseUrl: BASE_URL, model: modelId(), prices: priceTable(), user: req.user, maxOut: Number(settings.max_output_tokens) || 8192, ratePerMin: Number(settings.rate_limit_per_min) || 30 }));
 }));
 
 app.get('/stats', requireAdmin, ah(async (req, res) => {
@@ -782,7 +782,7 @@ app.get('/admin', requireAdmin, ah(async (req, res) => {
             (SELECT coalesce(sum(balance_thb),0) FROM users)::numeric AS balance,
             (SELECT coalesce(sum(amount_thb),0) FROM orders WHERE status='paid')::numeric AS revenue,
             (SELECT coalesce(sum(cost_thb),0) FROM usage_logs WHERE created_at > now() - interval '30 days')::numeric AS cost30,
-            (SELECT count(*) FROM support_messages WHERE status <> 'closed')::int AS open_tickets`
+            (SELECT count(*) FROM support_messages WHERE status <> 'closed' AND reply_text IS NULL)::int AS open_tickets`
   )).rows[0];
   res.type('html').send(V.adminHome({ pending, paid, rows, totals, flash: takeFlash(req, res), user: req.user }));
 }));
@@ -913,7 +913,7 @@ app.post('/admin/users/:id/credit', requireAdmin, ah(async (req, res) => {
 
 app.get('/admin/support', requireAdmin, ah(async (req, res) => {
   const rows = (await q(
-    `SELECT s.id, s.user_id, s.email, s.topic, s.message, s.status, s.created_at, u.status AS user_status
+    `SELECT s.id, s.user_id, s.email, s.topic, s.message, s.status, s.reply_text, s.replied_at, s.created_at, u.status AS user_status
        FROM support_messages s LEFT JOIN users u ON u.id = s.user_id
       ORDER BY s.id DESC LIMIT 200`
   )).rows;
@@ -929,6 +929,25 @@ app.post('/admin/support/:id/close', requireAdmin, ah(async (req, res) => {
 app.post('/admin/support/:id/reopen', requireAdmin, ah(async (req, res) => {
   await q(`UPDATE support_messages SET status='open' WHERE id=$1`, [Number(req.params.id)]);
   setFlash(res, 'เปิดข้อความอีกครั้งแล้ว');
+  res.redirect('/admin/support');
+}));
+
+app.post('/admin/support/:id/reply', requireAdmin, ah(async (req, res) => {
+  const id = Number(req.params.id);
+  const text = String((req.body && req.body.reply) || '').trim().slice(0, 2000);
+  if (text.length < 2) {
+    setFlash(res, 'ข้อความตอบกลับสั้นเกินไป');
+    return res.redirect('/admin/support');
+  }
+  const close = String((req.body && req.body.close) || '') === '1';
+  const by = String(req.user.email || 'admin').slice(0, 200);
+  if (close) {
+    await q(`UPDATE support_messages SET reply_text=$2, replied_at=now(), replied_by=$3, status='closed' WHERE id=$1`, [id, text, by]);
+    setFlash(res, 'บันทึกคำตอบและปิดข้อความแล้ว');
+  } else {
+    await q(`UPDATE support_messages SET reply_text=$2, replied_at=now(), replied_by=$3 WHERE id=$1`, [id, text, by]);
+    setFlash(res, 'บันทึกคำตอบแล้ว');
+  }
   res.redirect('/admin/support');
 }));
 
