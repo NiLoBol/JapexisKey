@@ -21,6 +21,14 @@ const app = express();
 app.set('trust proxy', true);
 app.disable('x-powered-by');
 app.use((req, res, next) => {
+  const incoming = String(req.headers['x-request-id'] || '').trim();
+  req.reqId = /^[A-Za-z0-9._-]{1,64}$/.test(incoming)
+    ? incoming
+    : 'jxk-' + crypto.randomBytes(12).toString('hex');
+  res.setHeader('X-Request-Id', req.reqId);
+  next();
+});
+app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
@@ -290,7 +298,7 @@ function rateLimitHit(keyId) {
   if (rlBuckets.size > 5000) {
     for (const [k, v] of rlBuckets) if (now - v.start > 60000) rlBuckets.delete(k);
   }
-  return b.count <= limit;
+  return { ok: b.count <= limit, retryAfter: Math.max(1, Math.ceil((b.start + 60000 - now) / 1000)) };
 }
 
 /* ---------- request context ---------- */
@@ -1033,7 +1041,8 @@ app.get('/admin/usage.csv', requireAdmin, ah(async (req, res) => {
 
 app.use('/v1', (req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, OpenAI-Organization, OpenAI-Project');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, OpenAI-Organization, OpenAI-Project, X-Request-Id');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Request-Id, X-JapexisKey-Cost, X-JapexisKey-Balance, Retry-After');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -1118,7 +1127,7 @@ app.get('/v1/usage', apiAuth, ah(async (req, res) => {
 app.post('/v1/chat/completions', apiAuth, ah(async (req, res) => {
   const started = Date.now();
   const { user, key } = req.api;
-  const reqId = 'jxk-' + crypto.randomBytes(8).toString('hex');
+  const reqId = req.reqId;
   const ip = clientIp(req);
   const body = req.body || {};
   const p = priceTable();
@@ -1134,7 +1143,9 @@ app.post('/v1/chat/completions', apiAuth, ah(async (req, res) => {
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return apiError(res, 400, 'ต้องมี messages อย่างน้อย 1 รายการ', 'invalid_request_error', 'invalid_messages');
   }
-  if (!rateLimitHit(key.id)) {
+  const rl = rateLimitHit(key.id);
+  if (!rl.ok) {
+    res.setHeader('Retry-After', String(rl.retryAfter));
     return apiError(res, 429, `เรียกใช้งานถี่เกินกำหนด (${settings.rate_limit_per_min || 30} ครั้ง/นาที) — ลองใหม่ภายหลัง`, 'rate_limit_error', 'rate_limit_exceeded');
   }
   if (!UPSTREAM_API_KEY) {
