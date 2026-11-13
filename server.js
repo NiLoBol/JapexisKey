@@ -125,6 +125,21 @@ function signupAllowed(ip) {
   return b.count <= 5;
 }
 
+const supportHits = new Map();
+function supportAllowed(userId) {
+  const now = Date.now();
+  let b = supportHits.get(userId);
+  if (!b || now - b.start > 3600000) {
+    b = { start: now, count: 0 };
+    supportHits.set(userId, b);
+  }
+  b.count += 1;
+  if (supportHits.size > 5000) {
+    for (const [k, v] of supportHits) if (now - v.start > 3600000) supportHits.delete(k);
+  }
+  return b.count <= 3;
+}
+
 function apiError(res, status, message, type = 'invalid_request_error', code = null) {
   return res.status(status).json({ error: { message, type, code } });
 }
@@ -286,7 +301,31 @@ app.get('/privacy', ah(async (req, res) => {
 }));
 
 app.get('/help', ah(async (req, res) => {
-  res.type('html').send(V.helpPage({ user: req.user, payReady: payReady(), model: modelId(), baseUrl: BASE_URL }));
+  res.type('html').send(V.helpPage({ user: req.user, payReady: payReady(), model: modelId(), baseUrl: BASE_URL, flash: takeFlash(req, res) }));
+}));
+
+app.post('/help/message', ah(async (req, res) => {
+  if (!req.user) {
+    setFlash(res, 'กรุณาเข้าสู่ระบบก่อนส่งข้อความ');
+    return res.redirect('/help');
+  }
+  const topics = ['api', 'billing', 'key', 'other'];
+  const topic = topics.includes(String((req.body && req.body.topic) || '')) ? String(req.body.topic) : 'other';
+  const message = String((req.body && req.body.message) || '').trim().slice(0, 2000);
+  if (message.length < 10) {
+    setFlash(res, 'ข้อความสั้นเกินไป — กรุณาเขียนอย่างน้อย 10 ตัวอักษร');
+    return res.redirect('/help');
+  }
+  if (!supportAllowed(req.user.id)) {
+    setFlash(res, 'ส่งข้อความบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่');
+    return res.redirect('/help');
+  }
+  await q(
+    'INSERT INTO support_messages (user_id, email, topic, message, ip) VALUES ($1,$2,$3,$4,$5)',
+    [req.user.id, req.user.email, topic, message, clientIp(req)]
+  );
+  setFlash(res, 'ส่งข้อความถึงฝ่ายบริการลูกค้าแล้ว — จะตอบกลับทางอีเมล');
+  res.redirect('/help');
 }));
 
 app.get('/docs', ah(async (req, res) => {
@@ -829,6 +868,27 @@ app.post('/admin/users/:id/credit', requireAdmin, ah(async (req, res) => {
     client.release();
   }
   res.redirect('/admin/users');
+}));
+
+app.get('/admin/support', requireAdmin, ah(async (req, res) => {
+  const rows = (await q(
+    `SELECT s.id, s.email, s.topic, s.message, s.status, s.created_at, u.status AS user_status
+       FROM support_messages s LEFT JOIN users u ON u.id = s.user_id
+      ORDER BY s.id DESC LIMIT 200`
+  )).rows;
+  res.type('html').send(V.adminSupport({ rows, flash: takeFlash(req, res), user: req.user }));
+}));
+
+app.post('/admin/support/:id/close', requireAdmin, ah(async (req, res) => {
+  await q(`UPDATE support_messages SET status='closed' WHERE id=$1`, [Number(req.params.id)]);
+  setFlash(res, 'ปิดข้อความแล้ว');
+  res.redirect('/admin/support');
+}));
+
+app.post('/admin/support/:id/reopen', requireAdmin, ah(async (req, res) => {
+  await q(`UPDATE support_messages SET status='open' WHERE id=$1`, [Number(req.params.id)]);
+  setFlash(res, 'เปิดข้อความอีกครั้งแล้ว');
+  res.redirect('/admin/support');
 }));
 
 app.get('/admin/settings', requireAdmin, (req, res) => {
