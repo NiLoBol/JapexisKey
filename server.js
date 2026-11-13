@@ -20,6 +20,15 @@ const UPSTREAM_MODEL_ID = (process.env.UPSTREAM_MODEL_ID || 'deepseek-v4.1-flash
 const app = express();
 app.set('trust proxy', true);
 app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+  next();
+});
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: false, limit: '2mb' }));
 
@@ -270,6 +279,10 @@ app.get('/status', ah(async (req, res) => {
   try { await q('SELECT 1'); } catch { dbOk = false; }
   const dbMs = Date.now() - t0;
   res.type('html').send(V.statusPage({ dbOk, dbMs, model: modelId(), prices: priceTable(), payReady: payReady(), baseUrl: BASE_URL, upstream: Boolean(UPSTREAM_API_KEY), user: req.user }));
+}));
+
+app.get('/privacy', ah(async (req, res) => {
+  res.type('html').send(V.privacyPage({ user: req.user }));
 }));
 
 app.get('/docs', ah(async (req, res) => {
