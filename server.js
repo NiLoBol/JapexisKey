@@ -34,7 +34,7 @@ app.use((req, res, next) => {
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
   res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
   next();
 });
 app.use(express.json({ limit: '25mb' }));
@@ -315,6 +315,108 @@ function rateLimitHit(keyId) {
   return { ok: b.count <= limit, retryAfter: Math.max(1, Math.ceil((b.start + 60000 - now) / 1000)) };
 }
 
+/* ---------- public stats (anonymous — no user data) ---------- */
+
+const PUBLIC_STATS_TTL_MS = 30000;
+const BKK_OFFSET_MS = 7 * 3600 * 1000;
+let publicStatsCache = { at: 0, data: null };
+
+function bkkDay(ms) {
+  const d = new Date(ms + BKK_OFFSET_MS);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+function publicStatsEmpty() {
+  const now = Date.now();
+  const days14 = [];
+  for (let i = 13; i >= 0; i--) days14.push({ d: bkkDay(now - i * 86400000), n: 0 });
+  return {
+    uptimeSec: Math.round(process.uptime()),
+    dbOk: false,
+    dbMs: 0,
+    req24: 0,
+    req7d: 0,
+    okRate: null,
+    reqTotal: 0,
+    days14,
+    lastAt: null,
+  };
+}
+
+async function publicStats() {
+  const now = Date.now();
+  if (publicStatsCache.data && now - publicStatsCache.at < PUBLIC_STATS_TTL_MS) return publicStatsCache.data;
+
+  const days14 = [];
+  for (let i = 13; i >= 0; i--) days14.push({ d: bkkDay(now - i * 86400000), n: 0 });
+  const t0 = Date.now();
+  let data;
+  try {
+    const totals = (await q(
+      `SELECT (count(*))::bigint AS total,
+              (count(*) FILTER (WHERE created_at > now() - interval '24 hours'))::int AS req24,
+              (count(*) FILTER (WHERE created_at > now() - interval '7 days'))::int AS req7d,
+              (count(*) FILTER (WHERE created_at > now() - interval '7 days' AND status >= 200 AND status < 400))::int AS ok7d,
+              max(created_at) AS last_at
+         FROM usage_logs`
+    )).rows[0];
+
+    const sinceMs = Date.parse(`${days14[0].d}T00:00:00+07:00`);
+    const rows = (await q(
+      `SELECT to_char(created_at AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM-DD') AS d, count(*)::int AS n
+         FROM usage_logs
+        WHERE created_at >= $1::timestamptz
+        GROUP BY 1`,
+      [new Date(sinceMs).toISOString()]
+    )).rows;
+
+    const byDay = new Map();
+    for (const r of rows) byDay.set(r.d, Number(r.n) || 0);
+    for (const day of days14) day.n = byDay.get(day.d) || 0;
+
+    const req7d = Number(totals.req7d) || 0;
+    const ok7d = Number(totals.ok7d) || 0;
+    data = {
+      uptimeSec: Math.round(process.uptime()),
+      dbOk: true,
+      dbMs: Date.now() - t0,
+      req24: Number(totals.req24) || 0,
+      req7d,
+      okRate: req7d > 0 ? Math.min(100, Math.max(0, Math.round((ok7d / req7d) * 100))) : null,
+      reqTotal: Number(totals.total) || 0,
+      days14,
+      lastAt: totals.last_at ? new Date(totals.last_at).toISOString() : null,
+    };
+  } catch (err) {
+    console.error('publicStats failed', err && err.message ? err.message : err);
+    data = publicStatsEmpty();
+    data.dbMs = Date.now() - t0;
+  }
+  publicStatsCache = { at: Date.now(), data };
+  return data;
+}
+
+// 14-day request counts for one user (Bangkok days, oldest → newest)
+async function userDays14(userId) {
+  const now = Date.now();
+  const days = [];
+  for (let i = 13; i >= 0; i--) days.push({ d: bkkDay(now - i * 86400000), n: 0 });
+  try {
+    const rows = (await q(
+      `SELECT to_char(created_at AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM-DD') AS d, count(*)::int AS n
+         FROM usage_logs
+        WHERE user_id = $1 AND created_at >= $2::timestamptz
+        GROUP BY 1`,
+      [userId, new Date(Date.parse(`${days[0].d}T00:00:00+07:00`)).toISOString()]
+    )).rows;
+    const byDay = new Map(rows.map((r) => [r.d, Number(r.n) || 0]));
+    for (const day of days) day.n = byDay.get(day.d) || 0;
+  } catch (err) {
+    console.error('userDays14 failed', err && err.message ? err.message : err);
+  }
+  return days;
+}
+
 /* ---------- request context ---------- */
 
 app.use(ah(async (req, res, next) => {
@@ -327,12 +429,14 @@ app.use(ah(async (req, res, next) => {
 app.get('/', ah(async (req, res) => {
   if (req.user) return res.redirect('/app');
   const plans = await getPlans();
-  res.type('html').send(V.landing({ plans, prices: priceTable(), baseUrl: BASE_URL, google: googleEnabled(), model: modelId(), user: null, payReady: payReady() }));
+  const stats = await publicStats();
+  res.type('html').send(V.landing({ plans, prices: priceTable(), baseUrl: BASE_URL, google: googleEnabled(), model: modelId(), user: null, payReady: payReady(), stats }));
 }));
 
 app.get('/pricing', ah(async (req, res) => {
   const plans = await getPlans();
-  res.type('html').send(V.pricingPage({ plans, prices: priceTable(), user: req.user, payReady: payReady(), model: modelId(), flash: takeFlash(req, res) }));
+  const stats = await publicStats();
+  res.type('html').send(V.pricingPage({ plans, prices: priceTable(), user: req.user, payReady: payReady(), model: modelId(), flash: takeFlash(req, res), stats }));
 }));
 
 app.get('/status', ah(async (req, res) => {
@@ -340,7 +444,8 @@ app.get('/status', ah(async (req, res) => {
   let dbOk = true;
   try { await q('SELECT 1'); } catch { dbOk = false; }
   const dbMs = Date.now() - t0;
-  res.type('html').send(V.statusPage({ dbOk, dbMs, model: modelId(), prices: priceTable(), payReady: payReady(), baseUrl: BASE_URL, upstream: Boolean(UPSTREAM_API_KEY), uptime: process.uptime(), user: req.user }));
+  const stats = await publicStats();
+  res.type('html').send(V.statusPage({ dbOk, dbMs, model: modelId(), prices: priceTable(), payReady: payReady(), baseUrl: BASE_URL, upstream: Boolean(UPSTREAM_API_KEY), uptime: process.uptime(), user: req.user, stats }));
 }));
 
 app.get('/privacy', ah(async (req, res) => {
@@ -415,6 +520,11 @@ app.get('/health', ah(async (req, res) => {
 }));
 app.get('/api/health', ah(async (req, res) => {
   try { await q('SELECT 1'); res.json({ ok: true, uptime: Math.round(process.uptime()), db: 'ok' }); } catch (e) { res.status(503).json({ ok: false, db: 'down' }); }
+}));
+
+app.get('/api/public/stats', ah(async (req, res) => {
+  res.setHeader('Cache-Control', 'public, max-age=30');
+  res.json(await publicStats());
 }));
 
 /* ---------- auth pages (Google only) ---------- */
@@ -569,6 +679,7 @@ app.get('/app', requireLogin, ah(async (req, res) => {
 
   const keys = (await q('SELECT id, name, prefix, created_at, last_used_at, revoked FROM api_keys WHERE user_id = $1 ORDER BY id DESC', [req.user.id])).rows;
   const stats = await dailyStats(req.user.id, '30d');
+  const udays = await userDays14(req.user.id);
   const recent = (await q(
     `SELECT created_at, model, status, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, cost_thb, stream, estimated
        FROM usage_logs WHERE user_id = $1 ORDER BY id DESC LIMIT 8`, [req.user.id]
@@ -605,6 +716,7 @@ app.get('/app', requireLogin, ah(async (req, res) => {
     model: modelId(),
     credit: { estRequests, low, basis: estBasis },
     flash: takeFlash(req, res),
+    udays,
   }));
 }));
 
@@ -708,7 +820,8 @@ app.get('/app/usage', requireLogin, ah(async (req, res) => {
     week: await dailyStats(req.user.id, 'week'),
     month: await dailyStats(req.user.id, 'month'),
   };
-  res.type('html').send(V.usagePage({ user: req.user, stats, rows, range, periods }));
+  const udays = await userDays14(req.user.id);
+  res.type('html').send(V.usagePage({ user: req.user, stats, rows, range, periods, udays }));
 }));
 
 app.get('/app/usage.csv', requireLogin, ah(async (req, res) => {
